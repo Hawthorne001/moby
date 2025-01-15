@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/container"
@@ -19,7 +18,7 @@ import (
 
 // containerStatPath stats the filesystem resource at the specified path in this
 // container. Returns stat info about the resource.
-func (daemon *Daemon) containerStatPath(container *container.Container, path string) (stat *types.ContainerPathStat, err error) {
+func (daemon *Daemon) containerStatPath(container *container.Container, path string) (stat *containertypes.PathStat, err error) {
 	container.Lock()
 	defer container.Unlock()
 
@@ -53,7 +52,7 @@ func (daemon *Daemon) containerStatPath(container *container.Container, path str
 // containerArchivePath creates an archive of the filesystem resource at the specified
 // path in this container. Returns a tar archive of the resource and stat info
 // about the resource.
-func (daemon *Daemon) containerArchivePath(container *container.Container, path string) (content io.ReadCloser, stat *types.ContainerPathStat, err error) {
+func (daemon *Daemon) containerArchivePath(container *container.Container, path string) (content io.ReadCloser, stat *containertypes.PathStat, err error) {
 	container.Lock()
 
 	defer func() {
@@ -348,17 +347,13 @@ func checkIfPathIsInAVolume(container *container.Container, absPath string) (boo
 // cannot have their file-system interrogated from the host as the filter is
 // loaded inside the utility VM, not the host.
 // IMPORTANT: The container lock MUST be held when calling this function.
-func (daemon *Daemon) isOnlineFSOperationPermitted(container *container.Container) error {
-	if !container.Running {
+func (daemon *Daemon) isOnlineFSOperationPermitted(ctr *container.Container) error {
+	if !ctr.Running {
 		return nil
 	}
 
 	// Determine isolation. If not specified in the hostconfig, use daemon default.
-	actualIsolation := container.HostConfig.Isolation
-	if containertypes.Isolation.IsDefault(containertypes.Isolation(actualIsolation)) {
-		actualIsolation = daemon.defaultIsolation
-	}
-	if containertypes.Isolation.IsHyperV(actualIsolation) {
+	if ctr.HostConfig.Isolation.IsHyperV() || ctr.HostConfig.Isolation.IsDefault() && daemon.defaultIsolation.IsHyperV() {
 		return errors.New("filesystem operations against a running Hyper-V container are not supported")
 	}
 	return nil

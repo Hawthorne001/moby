@@ -214,15 +214,15 @@ func (o *copier) calcCopyInfo(origPath string, allowWildcards bool) ([]copyInfo,
 	}
 
 	// Deal with the single file case
-	copyInfo, err := copyInfoForFile(o.source, origPath)
+	info, err := copyInfoForFile(o.source, origPath)
 	switch {
 	case imageSource == nil && errors.Is(err, os.ErrNotExist):
 		return nil, errors.Wrapf(err, "file not found in build context or excluded by .dockerignore")
 	case err != nil:
 		return nil, err
-	case copyInfo.hash != "":
-		o.storeInPathCache(imageSource, origPath, copyInfo.hash)
-		return newCopyInfos(copyInfo), err
+	case info.hash != "":
+		o.storeInPathCache(imageSource, origPath, info.hash)
+		return newCopyInfos(info), err
 	}
 
 	// TODO: remove, handle dirs in Hash()
@@ -477,7 +477,7 @@ func performCopyForInfo(dest copyInfo, source copyInfo, options copyFileOptions)
 	}
 	// dest.path must be used because destPath has already been cleaned of any
 	// trailing slash
-	if endsInSlash(dest.path) || destExistsAsDir {
+	if destExistsAsDir || strings.HasSuffix(dest.path, string(os.PathSeparator)) {
 		// source.path must be used to get the correct filename when the source
 		// is a symlink
 		destPath = filepath.Join(destPath, filepath.Base(source.path))
@@ -502,11 +502,7 @@ func copyDirectory(archiver *archive.Archiver, source, dest string, identity *id
 
 func copyFile(archiver *archive.Archiver, source, dest string, identity *idtools.Identity) error {
 	if identity == nil {
-		// Use system.MkdirAll here, which is a custom version of os.MkdirAll
-		// modified for use on Windows to handle volume GUID paths. These paths
-		// are of the form \\?\Volume{<GUID>}\<path>. An example would be:
-		// \\?\Volume{dae8d3ac-b9a1-11e9-88eb-e8554b2ba1db}\bin\busybox.exe
-		if err := system.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			return err
 		}
 	} else {
@@ -522,10 +518,6 @@ func copyFile(archiver *archive.Archiver, source, dest string, identity *idtools
 		return fixPermissions(source, dest, *identity, false)
 	}
 	return nil
-}
-
-func endsInSlash(path string) bool {
-	return strings.HasSuffix(path, string(filepath.Separator))
 }
 
 // isExistingDirectory returns true if the path exists and is a directory

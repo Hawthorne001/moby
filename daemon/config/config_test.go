@@ -2,9 +2,11 @@ package config // import "github.com/docker/docker/daemon/config"
 
 import (
 	"encoding/json"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -157,7 +159,7 @@ func TestDaemonConfigurationMergeDefaultAddressPools(t *testing.T) {
 	emptyConfigFile := makeConfigFile(t, `{}`)
 	configFile := makeConfigFile(t, `{"default-address-pools":[{"base": "10.123.0.0/16", "size": 24 }]}`)
 
-	expected := []*ipamutils.NetworkToSplit{{Base: "10.123.0.0/16", Size: 24}}
+	expected := []*ipamutils.NetworkToSplit{{Base: netip.MustParsePrefix("10.123.0.0/16"), Size: 24}}
 
 	t.Run("empty config file", func(t *testing.T) {
 		conf := Config{}
@@ -167,7 +169,7 @@ func TestDaemonConfigurationMergeDefaultAddressPools(t *testing.T) {
 
 		config, err := MergeDaemonConfigurations(&conf, flags, emptyConfigFile)
 		assert.NilError(t, err)
-		assert.DeepEqual(t, config.DefaultAddressPools.Value(), expected)
+		assert.DeepEqual(t, config.DefaultAddressPools.Value(), expected, cmpopts.EquateComparable(netip.Prefix{}))
 	})
 
 	t.Run("config file", func(t *testing.T) {
@@ -177,7 +179,7 @@ func TestDaemonConfigurationMergeDefaultAddressPools(t *testing.T) {
 
 		config, err := MergeDaemonConfigurations(&conf, flags, configFile)
 		assert.NilError(t, err)
-		assert.DeepEqual(t, config.DefaultAddressPools.Value(), expected)
+		assert.DeepEqual(t, config.DefaultAddressPools.Value(), expected, cmpopts.EquateComparable(netip.Prefix{}))
 	})
 
 	t.Run("with conflicting options", func(t *testing.T) {
@@ -220,6 +222,7 @@ func TestValidateConfigurationErrors(t *testing.T) {
 		name        string
 		field       string
 		config      *Config
+		platform    string
 		expectedErr string
 	}{
 		{
@@ -351,6 +354,62 @@ func TestValidateConfigurationErrors(t *testing.T) {
 			},
 			expectedErr: "invalid logging level: foobar",
 		},
+		{
+			name: "exec-opt without value",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"no-value"},
+				},
+			},
+			expectedErr: "invalid exec-opt (no-value): must be formatted 'opt=value'",
+		},
+		{
+			name: "exec-opt with empty value",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"empty-value="},
+				},
+			},
+			expectedErr: "invalid exec-opt (empty-value=): must be formatted 'opt=value'",
+		},
+		{
+			name: "exec-opt without key",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"=empty-key"},
+				},
+			},
+			expectedErr: "invalid exec-opt (=empty-key): must be formatted 'opt=value'",
+		},
+		{
+			name: "exec-opt unknown option",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"unknown-option=any-value"},
+				},
+			},
+			expectedErr: "invalid exec-opt (unknown-option=any-value): unknown option: 'unknown-option'",
+		},
+		{
+			name: "exec-opt invalid on linux",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"isolation=default"},
+				},
+			},
+			platform:    "linux",
+			expectedErr: "invalid exec-opt (isolation=default): option 'isolation' is only supported on windows",
+		},
+		{
+			name: "exec-opt invalid on windows",
+			config: &Config{
+				CommonConfig: CommonConfig{
+					ExecOptions: []string{"native.cgroupdriver=systemd"},
+				},
+			},
+			platform:    "windows",
+			expectedErr: "invalid exec-opt (native.cgroupdriver=systemd): option 'native.cgroupdriver' is only supported on linux",
+		},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -362,7 +421,11 @@ func TestValidateConfigurationErrors(t *testing.T) {
 				assert.Check(t, mergo.Merge(cfg, tc.config, mergo.WithOverride))
 			}
 			err = Validate(cfg)
-			assert.Error(t, err, tc.expectedErr)
+			if tc.platform != "" && tc.platform != runtime.GOOS {
+				assert.NilError(t, err)
+			} else {
+				assert.Error(t, err, tc.expectedErr)
+			}
 		})
 	}
 }
@@ -546,7 +609,6 @@ func TestValidateMinAPIVersion(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			err := ValidateMinAPIVersion(tc.input)
 			if tc.expectedErr != "" {
@@ -556,7 +618,6 @@ func TestValidateMinAPIVersion(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 func TestConfigInvalidDNS(t *testing.T) {
@@ -578,7 +639,6 @@ func TestConfigInvalidDNS(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			var cfg Config
 			err := json.Unmarshal([]byte(tc.input), &cfg)

@@ -2,11 +2,9 @@ package bridge
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/containerd/log"
 	"github.com/docker/docker/libnetwork/netutils"
@@ -15,15 +13,7 @@ import (
 
 // SetupDevice create a new bridge interface/
 func setupDevice(config *networkConfiguration, i *bridgeInterface) error {
-	// We only attempt to create the bridge when the requested device name is
-	// the default one. The default bridge name can be overridden with the
-	// DOCKER_TEST_CREATE_DEFAULT_BRIDGE env var. It should be used only for
-	// test purpose.
-	var defaultBridgeName string
-	if defaultBridgeName = os.Getenv("DOCKER_TEST_CREATE_DEFAULT_BRIDGE"); defaultBridgeName == "" {
-		defaultBridgeName = DefaultBridgeName
-	}
-	if config.BridgeName != defaultBridgeName && config.DefaultBridge {
+	if config.BridgeName != DefaultBridgeName && config.DefaultBridge {
 		return NonDefaultBridgeExistError(config.BridgeName)
 	}
 
@@ -49,14 +39,6 @@ func setupDevice(config *networkConfiguration, i *bridgeInterface) error {
 
 func setupMTU(config *networkConfiguration, i *bridgeInterface) error {
 	if err := i.nlh.LinkSetMTU(i.Link, config.Mtu); err != nil {
-		// Before Linux v4.17, bridges couldn't be configured "manually" with an MTU greater than 1500, although it
-		// could be autoconfigured with such a value when interfaces were added to the bridge. In that case, the
-		// bridge MTU would be set automatically by the kernel to the lowest MTU of all interfaces attached. To keep
-		// compatibility with older kernels, we need to discard -EINVAL.
-		// TODO(aker): remove this once we drop support for CentOS/RHEL 7.
-		if config.Mtu > 1500 && config.Mtu <= 0xFFFF && errors.Is(err, syscall.EINVAL) {
-			return nil
-		}
 		log.G(context.TODO()).WithError(err).Errorf("Failed to set bridge MTU %s via netlink", config.BridgeName)
 		return err
 	}

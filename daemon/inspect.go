@@ -1,5 +1,5 @@
 // FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
-//go:build go1.19
+//go:build go1.22
 
 package daemon // import "github.com/docker/docker/daemon"
 
@@ -9,47 +9,20 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	containertypes "github.com/docker/docker/api/types/container"
 	networktypes "github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/internal/sliceutil"
-	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/go-connections/nat"
 )
 
 // ContainerInspect returns low-level information about a
 // container. Returns an error if the container cannot be found, or if
 // there is an error getting the data.
-func (daemon *Daemon) ContainerInspect(ctx context.Context, name string, size bool, version string) (interface{}, error) {
-	switch {
-	case versions.LessThan(version, "1.45"):
-		ctr, err := daemon.ContainerInspectCurrent(ctx, name, size)
-		if err != nil {
-			return nil, err
-		}
-
-		shortCID := stringid.TruncateID(ctr.ID)
-		for nwName, ep := range ctr.NetworkSettings.Networks {
-			if containertypes.NetworkMode(nwName).IsUserDefined() {
-				ep.Aliases = sliceutil.Dedup(append(ep.Aliases, shortCID, ctr.Config.Hostname))
-			}
-		}
-
-		return ctr, nil
-	default:
-		return daemon.ContainerInspectCurrent(ctx, name, size)
-	}
-}
-
-// ContainerInspectCurrent returns low-level information about a
-// container in a most recent api version.
-func (daemon *Daemon) ContainerInspectCurrent(ctx context.Context, name string, size bool) (*types.ContainerJSON, error) {
+func (daemon *Daemon) ContainerInspect(ctx context.Context, name string, options backend.ContainerInspectOptions) (*containertypes.InspectResponse, error) {
 	ctr, err := daemon.GetContainer(name)
 	if err != nil {
 		return nil, err
@@ -72,8 +45,8 @@ func (daemon *Daemon) ContainerInspectCurrent(ctx context.Context, name string, 
 	}
 
 	mountPoints := ctr.GetMountPoints()
-	networkSettings := &types.NetworkSettings{
-		NetworkSettingsBase: types.NetworkSettingsBase{
+	networkSettings := &containertypes.NetworkSettings{
+		NetworkSettingsBase: containertypes.NetworkSettingsBase{
 			Bridge:                 ctr.NetworkSettings.Bridge,
 			SandboxID:              ctr.NetworkSettings.SandboxID,
 			SandboxKey:             ctr.NetworkSettings.SandboxKey,
@@ -83,7 +56,7 @@ func (daemon *Daemon) ContainerInspectCurrent(ctx context.Context, name string, 
 			SecondaryIPAddresses:   ctr.NetworkSettings.SecondaryIPAddresses,
 			SecondaryIPv6Addresses: ctr.NetworkSettings.SecondaryIPv6Addresses,
 		},
-		DefaultNetworkSettings: daemon.getDefaultNetworkSettings(ctr.NetworkSettings.Networks),
+		DefaultNetworkSettings: getDefaultNetworkSettings(ctr.NetworkSettings.Networks),
 		Networks:               apiNetworks,
 	}
 
@@ -95,7 +68,7 @@ func (daemon *Daemon) ContainerInspectCurrent(ctx context.Context, name string, 
 
 	ctr.Unlock()
 
-	if size {
+	if options.Size {
 		sizeRw, sizeRootFs, err := daemon.imageService.GetContainerLayerSize(ctx, base.ID)
 		if err != nil {
 			return nil, err
@@ -104,15 +77,25 @@ func (daemon *Daemon) ContainerInspectCurrent(ctx context.Context, name string, 
 		base.SizeRootFs = &sizeRootFs
 	}
 
-	return &types.ContainerJSON{
-		ContainerJSONBase: base,
-		Mounts:            mountPoints,
-		Config:            ctr.Config,
-		NetworkSettings:   networkSettings,
+	imageManifest := ctr.ImageManifest
+	if imageManifest != nil && imageManifest.Platform == nil {
+		// Copy the image manifest to avoid mutating the original
+		c := *imageManifest
+		imageManifest = &c
+
+		imageManifest.Platform = &ctr.ImagePlatform
+	}
+
+	return &containertypes.InspectResponse{
+		ContainerJSONBase:       base,
+		Mounts:                  mountPoints,
+		Config:                  ctr.Config,
+		NetworkSettings:         networkSettings,
+		ImageManifestDescriptor: imageManifest,
 	}, nil
 }
 
-func (daemon *Daemon) getInspectData(daemonCfg *config.Config, container *container.Container) (*types.ContainerJSONBase, error) {
+func (daemon *Daemon) getInspectData(daemonCfg *config.Config, container *container.Container) (*containertypes.ContainerJSONBase, error) {
 	// make a copy to play with
 	hostConfig := *container.HostConfig
 
@@ -130,27 +113,23 @@ func (daemon *Daemon) getInspectData(daemonCfg *config.Config, container *contai
 	// unconditionally, to keep backward compatibility with clients that use
 	// unversioned API endpoints.
 	if container.Config != nil && container.Config.MacAddress == "" { //nolint:staticcheck // ignore SA1019: field is deprecated, but still used on API < v1.44.
-		if nwm := hostConfig.NetworkMode; nwm.IsDefault() || nwm.IsBridge() || nwm.IsUserDefined() {
-			name := nwm.NetworkName()
-			if nwm.IsDefault() {
-				name = daemon.netController.Config().DefaultNetwork
-			}
-			if epConf, ok := container.NetworkSettings.Networks[name]; ok {
+		if nwm := hostConfig.NetworkMode; nwm.IsBridge() || nwm.IsUserDefined() {
+			if epConf, ok := container.NetworkSettings.Networks[nwm.NetworkName()]; ok {
 				container.Config.MacAddress = epConf.DesiredMacAddress //nolint:staticcheck // ignore SA1019: field is deprecated, but still used on API < v1.44.
 			}
 		}
 	}
 
-	var containerHealth *types.Health
+	var containerHealth *containertypes.Health
 	if container.State.Health != nil {
-		containerHealth = &types.Health{
+		containerHealth = &containertypes.Health{
 			Status:        container.State.Health.Status(),
 			FailingStreak: container.State.Health.FailingStreak,
-			Log:           append([]*types.HealthcheckResult{}, container.State.Health.Log...),
+			Log:           append([]*containertypes.HealthcheckResult{}, container.State.Health.Log...),
 		}
 	}
 
-	containerState := &types.ContainerState{
+	containerState := &containertypes.State{
 		Status:     container.State.StateString(),
 		Running:    container.State.Running,
 		Paused:     container.State.Paused,
@@ -165,7 +144,7 @@ func (daemon *Daemon) getInspectData(daemonCfg *config.Config, container *contai
 		Health:     containerHealth,
 	}
 
-	contJSONBase := &types.ContainerJSONBase{
+	contJSONBase := &containertypes.ContainerJSONBase{
 		ID:           container.ID,
 		Created:      container.Created.Format(time.RFC3339Nano),
 		Path:         container.Path,
@@ -176,7 +155,7 @@ func (daemon *Daemon) getInspectData(daemonCfg *config.Config, container *contai
 		Name:         container.Name,
 		RestartCount: container.RestartCount,
 		Driver:       container.Driver,
-		Platform:     container.OS,
+		Platform:     container.ImagePlatform.OS,
 		MountLabel:   container.MountLabel,
 		ProcessLabel: container.ProcessLabel,
 		ExecIDs:      container.GetExecIDs(),
@@ -251,18 +230,20 @@ func (daemon *Daemon) ContainerExecInspect(id string) (*backend.ExecInspect, err
 
 // getDefaultNetworkSettings creates the deprecated structure that holds the information
 // about the bridge network for a container.
-func (daemon *Daemon) getDefaultNetworkSettings(networks map[string]*network.EndpointSettings) types.DefaultNetworkSettings {
-	var settings types.DefaultNetworkSettings
-
-	if defaultNetwork, ok := networks[networktypes.NetworkBridge]; ok && defaultNetwork.EndpointSettings != nil {
-		settings.EndpointID = defaultNetwork.EndpointID
-		settings.Gateway = defaultNetwork.Gateway
-		settings.GlobalIPv6Address = defaultNetwork.GlobalIPv6Address
-		settings.GlobalIPv6PrefixLen = defaultNetwork.GlobalIPv6PrefixLen
-		settings.IPAddress = defaultNetwork.IPAddress
-		settings.IPPrefixLen = defaultNetwork.IPPrefixLen
-		settings.IPv6Gateway = defaultNetwork.IPv6Gateway
-		settings.MacAddress = defaultNetwork.MacAddress
+func getDefaultNetworkSettings(networks map[string]*network.EndpointSettings) containertypes.DefaultNetworkSettings {
+	nw, ok := networks[networktypes.NetworkBridge]
+	if !ok || nw.EndpointSettings == nil {
+		return containertypes.DefaultNetworkSettings{}
 	}
-	return settings
+
+	return containertypes.DefaultNetworkSettings{
+		EndpointID:          nw.EndpointSettings.EndpointID,
+		Gateway:             nw.EndpointSettings.Gateway,
+		GlobalIPv6Address:   nw.EndpointSettings.GlobalIPv6Address,
+		GlobalIPv6PrefixLen: nw.EndpointSettings.GlobalIPv6PrefixLen,
+		IPAddress:           nw.EndpointSettings.IPAddress,
+		IPPrefixLen:         nw.EndpointSettings.IPPrefixLen,
+		IPv6Gateway:         nw.EndpointSettings.IPv6Gateway,
+		MacAddress:          nw.EndpointSettings.MacAddress,
+	}
 }

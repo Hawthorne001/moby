@@ -282,65 +282,6 @@ func verifyIPTablesDoesNotContains(c *testing.T, ipTablesSearchString string) {
 	}
 }
 
-// TestDaemonIPv6Enabled checks that when the daemon is started with --ipv6=true that the docker0 bridge
-// has the fe80::1 address and that a container is assigned a link-local address
-func (s *DockerDaemonSuite) TestDaemonIPv6Enabled(c *testing.T) {
-	testRequires(c, IPv6)
-
-	setupV6(c)
-	defer teardownV6(c)
-
-	s.d.StartWithBusybox(testutil.GetContext(c), c, "--ipv6")
-
-	iface, err := net.InterfaceByName("docker0")
-	if err != nil {
-		c.Fatalf("Error getting docker0 interface: %v", err)
-	}
-
-	addrs, err := iface.Addrs()
-	if err != nil {
-		c.Fatalf("Error getting addresses for docker0 interface: %v", err)
-	}
-
-	var found bool
-	expected := "fe80::1/64"
-
-	for i := range addrs {
-		if addrs[i].String() == expected {
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		c.Fatalf("Bridge does not have an IPv6 Address")
-	}
-
-	if out, err := s.d.Cmd("run", "-itd", "--name=ipv6test", "busybox:latest"); err != nil {
-		c.Fatalf("Could not run container: %s, %v", out, err)
-	}
-
-	out, err := s.d.Cmd("inspect", "--format", "'{{.NetworkSettings.Networks.bridge.LinkLocalIPv6Address}}'", "ipv6test")
-	if err != nil {
-		c.Fatalf("Error inspecting container: %s, %v", out, err)
-	}
-	out = strings.Trim(out, " \r\n'")
-
-	if ip := net.ParseIP(out); ip == nil {
-		c.Fatalf("Container should have a link-local IPv6 address")
-	}
-
-	out, err = s.d.Cmd("inspect", "--format", "'{{.NetworkSettings.Networks.bridge.GlobalIPv6Address}}'", "ipv6test")
-	if err != nil {
-		c.Fatalf("Error inspecting container: %s, %v", out, err)
-	}
-	out = strings.Trim(out, " \r\n'")
-
-	if ip := net.ParseIP(out); ip != nil {
-		c.Fatalf("Container should not have a global IPv6 address: %v", out)
-	}
-}
-
 // TestDaemonIPv6FixedCIDR checks that when the daemon is started with --ipv6=true and a fixed CIDR
 // that running containers are given a link-local and global IPv6 address
 func (s *DockerDaemonSuite) TestDaemonIPv6FixedCIDR(c *testing.T) {
@@ -399,7 +340,7 @@ func (s *DockerDaemonSuite) TestDaemonIPv6HostMode(c *testing.T) {
 
 	out, err = s.d.Cmd("exec", "hostcnt", "ip", "-6", "addr", "show", "docker0")
 	assert.NilError(c, err, out)
-	assert.Assert(c, strings.Contains(strings.Trim(out, " \r\n'"), "2001:db8:2::1"))
+	assert.Assert(c, is.Contains(strings.Trim(out, " \r\n'"), "2001:db8:2::1"))
 }
 
 func (s *DockerDaemonSuite) TestDaemonLogLevelWrong(c *testing.T) {
@@ -547,7 +488,7 @@ func (s *DockerDaemonSuite) TestDaemonBridgeNone(c *testing.T) {
 	// verify default "bridge" network is not there
 	out, err := d.Cmd("network", "inspect", "bridge")
 	assert.ErrorContains(c, err, "", `"bridge" network should not be present if daemon started with --bridge=none`)
-	assert.Assert(c, strings.Contains(out, "No such network"))
+	assert.Assert(c, is.Contains(out, "No such network"))
 }
 
 func createInterface(c *testing.T, ifType string, ifName string, ipNet string) {
@@ -763,7 +704,7 @@ func (s *DockerDaemonSuite) TestDaemonIP(c *testing.T) {
 
 	out, err := d.Cmd("run", "-d", "-p", "8000:8000", "busybox", "top")
 	assert.Assert(c, err != nil, "Running a container must fail with an invalid --ip option")
-	assert.Equal(c, strings.Contains(out, "Error starting userland proxy"), true)
+	assert.Check(c, is.Contains(out, "failed to bind host port for 192.170.1.1"))
 
 	ifName := "dummy"
 	createInterface(c, "dummy", ifName, ipStr)
@@ -1095,7 +1036,7 @@ func (s *DockerDaemonSuite) TestDaemonLoggingDriverNoneLogsError(c *testing.T) {
 	out, err = s.d.Cmd("logs", "test")
 	assert.Assert(c, err != nil, "Logs should fail with 'none' driver")
 	expected := `configured logging driver does not support reading`
-	assert.Assert(c, strings.Contains(out, expected))
+	assert.Assert(c, is.Contains(out, expected))
 }
 
 func (s *DockerDaemonSuite) TestDaemonLoggingDriverShouldBeIgnoredForBuild(c *testing.T) {
@@ -1392,43 +1333,6 @@ func (s *DockerDaemonSuite) TestDaemonRestartWithContainerRunning(t *testing.T) 
 	}
 }
 
-func (s *DockerDaemonSuite) TestDaemonRestartCleanupNetns(c *testing.T) {
-	s.d.StartWithBusybox(testutil.GetContext(c), c)
-	out, err := s.d.Cmd("run", "--name", "netns", "-d", "busybox", "top")
-	if err != nil {
-		c.Fatal(out, err)
-	}
-
-	// Get sandbox key via inspect
-	out, err = s.d.Cmd("inspect", "--format", "'{{.NetworkSettings.SandboxKey}}'", "netns")
-	if err != nil {
-		c.Fatalf("Error inspecting container: %s, %v", out, err)
-	}
-	fileName := strings.Trim(out, " \r\n'")
-
-	if out, err := s.d.Cmd("stop", "netns"); err != nil {
-		c.Fatal(out, err)
-	}
-
-	// Test if the file still exists
-	icmd.RunCommand("stat", "-c", "%n", fileName).Assert(c, icmd.Expected{
-		Out: fileName,
-	})
-
-	// Remove the container and restart the daemon
-	if out, err := s.d.Cmd("rm", "netns"); err != nil {
-		c.Fatal(out, err)
-	}
-
-	s.d.Restart(c)
-
-	// Test again and see now the netns file does not exist
-	icmd.RunCommand("stat", "-c", "%n", fileName).Assert(c, icmd.Expected{
-		Err:      "No such file or directory",
-		ExitCode: 1,
-	})
-}
-
 // tests regression detailed in #13964 where DOCKER_TLS_VERIFY env is ignored
 func (s *DockerDaemonSuite) TestDaemonTLSVerifyIssue13964(c *testing.T) {
 	host := "tcp://localhost:4271"
@@ -1440,17 +1344,6 @@ func (s *DockerDaemonSuite) TestDaemonTLSVerifyIssue13964(c *testing.T) {
 		ExitCode: 1,
 		Err:      "error during connect",
 	})
-}
-
-func setupV6(c *testing.T) {
-	// Hack to get the right IPv6 address on docker0, which has already been created
-	result := icmd.RunCommand("ip", "addr", "add", "fe80::1/64", "dev", "docker0")
-	result.Assert(c, icmd.Success)
-}
-
-func teardownV6(c *testing.T) {
-	result := icmd.RunCommand("ip", "addr", "del", "fe80::1/64", "dev", "docker0")
-	result.Assert(c, icmd.Success)
 }
 
 func (s *DockerDaemonSuite) TestDaemonRestartWithContainerWithRestartPolicyAlways(c *testing.T) {
@@ -1484,8 +1377,8 @@ func (s *DockerDaemonSuite) TestDaemonWideLogConfig(c *testing.T) {
 
 	out, err = s.d.Cmd("inspect", "-f", "{{ .HostConfig.LogConfig.Config }}", name)
 	assert.NilError(c, err, "Output: %s", out)
-	assert.Assert(c, strings.Contains(out, "max-size:1k"))
-	assert.Assert(c, strings.Contains(out, "max-file:5"))
+	assert.Assert(c, is.Contains(out, "max-size:1k"))
+	assert.Assert(c, is.Contains(out, "max-file:5"))
 
 	out, err = s.d.Cmd("inspect", "-f", "{{ .HostConfig.LogConfig.Type }}", name)
 	assert.NilError(c, err, "Output: %s", out)
@@ -1537,7 +1430,7 @@ func (s *DockerDaemonSuite) TestDaemonRestartRmVolumeInUse(c *testing.T) {
 
 	out, err = s.d.Cmd("volume", "rm", "test")
 	assert.Assert(c, err != nil, "should not be able to remove in use volume after daemon restart")
-	assert.Assert(c, strings.Contains(out, "in use"))
+	assert.Assert(c, is.Contains(out, "in use"))
 }
 
 func (s *DockerDaemonSuite) TestDaemonRestartLocalVolumes(c *testing.T) {
@@ -1596,7 +1489,8 @@ func (s *DockerDaemonSuite) TestDaemonStartWithDefaultTLSHost(c *testing.T) {
 
 	var certRequestInfo *tls.CertificateRequestInfo
 	conn, err := tls.Dial("tcp", fmt.Sprintf("%s:%d", opts.DefaultHTTPHost, opts.DefaultTLSHTTPPort), &tls.Config{
-		RootCAs: rootPool,
+		RootCAs:    rootPool,
+		MinVersion: tls.VersionTLS12,
 		GetClientCertificate: func(cri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			certRequestInfo = cri
 			cert, err := tls.LoadX509KeyPair("fixtures/https/client-cert.pem", "fixtures/https/client-key.pem")
@@ -1647,7 +1541,7 @@ func (s *DockerDaemonSuite) TestDaemonNoSpaceLeftOnDeviceError(c *testing.T) {
 	testDir, err := os.MkdirTemp("", "no-space-left-on-device-test")
 	assert.NilError(c, err)
 	defer os.RemoveAll(testDir)
-	assert.Assert(c, mount.MakeRShared(testDir) == nil)
+	assert.NilError(c, mount.MakeRShared(testDir))
 	defer mount.Unmount(testDir)
 
 	// create a 3MiB image (with a 2MiB ext4 fs) and mount it as storage root
@@ -1897,7 +1791,7 @@ func (s *DockerDaemonSuite) TestCleanupMountsAfterDaemonCrash(c *testing.T) {
 	id := strings.TrimSpace(out)
 
 	// kill the daemon
-	assert.Assert(c, s.d.Kill() == nil)
+	assert.NilError(c, s.d.Kill())
 
 	// Check if there are mounts with container id visible from the host.
 	// If not, those mounts exist in container's own mount ns, and so
@@ -2001,7 +1895,7 @@ func (s *DockerDaemonSuite) TestRunLinksChanged(c *testing.T) {
 
 	out, err = s.d.Cmd("run", "--name=test2", "--link=test:abc", "busybox", "sh", "-c", "ping -c 1 abc")
 	assert.NilError(c, err, out)
-	assert.Assert(c, strings.Contains(out, "1 packets transmitted, 1 packets received"))
+	assert.Assert(c, is.Contains(out, "1 packets transmitted, 1 packets received"))
 	out, err = s.d.Cmd("rm", "-f", "test")
 	assert.NilError(c, err, out)
 
@@ -2041,7 +1935,7 @@ func (s *DockerDaemonSuite) TestDaemonStartWithoutColors(c *testing.T) {
 	s.d.Stop(c)
 	// Wait for io.Copy() before checking output
 	<-done
-	assert.Assert(c, strings.Contains(b.String(), infoLog))
+	assert.Assert(c, is.Contains(b.String(), infoLog))
 	b.Reset()
 
 	// "tty" is already closed in prev s.d.Stop(),
@@ -2082,7 +1976,7 @@ func (s *DockerDaemonSuite) TestDaemonDebugLog(c *testing.T) {
 
 	s.d.StartWithLogFile(tty, "--debug")
 	s.d.Stop(c)
-	assert.Assert(c, strings.Contains(b.String(), debugLog))
+	assert.Assert(c, is.Contains(b.String(), debugLog))
 }
 
 // Test for #21956
@@ -2095,7 +1989,7 @@ func (s *DockerDaemonSuite) TestDaemonLogOptions(c *testing.T) {
 
 	out, err = s.d.Cmd("inspect", "--format='{{.HostConfig.LogConfig}}'", id)
 	assert.NilError(c, err, out)
-	assert.Assert(c, strings.Contains(out, "{json-file map[]}"))
+	assert.Assert(c, is.Contains(out, "{json-file map[]}"))
 }
 
 // Test case for #20936, #22443
@@ -2108,8 +2002,8 @@ func (s *DockerDaemonSuite) TestDaemonMaxConcurrency(c *testing.T) {
 	expectedMaxConcurrentDownloads := `level=debug msg="Max Concurrent Downloads: 8"`
 	content, err := s.d.ReadLogFile()
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentUploads))
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentDownloads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentUploads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentDownloads))
 }
 
 // Test case for #20936, #22443
@@ -2120,7 +2014,7 @@ func (s *DockerDaemonSuite) TestDaemonMaxConcurrencyWithConfigFile(c *testing.T)
 
 	// daemon config file
 	const configFilePath = "test-daemon.json"
-	err := os.WriteFile(configFilePath, []byte(`{ "max-concurrent-downloads" : 8 }`), 0666)
+	err := os.WriteFile(configFilePath, []byte(`{ "max-concurrent-downloads" : 8 }`), 0o666)
 	assert.NilError(c, err)
 	defer os.Remove(configFilePath)
 	s.d.Start(c, fmt.Sprintf("--config-file=%s", configFilePath))
@@ -2129,11 +2023,11 @@ func (s *DockerDaemonSuite) TestDaemonMaxConcurrencyWithConfigFile(c *testing.T)
 	expectedMaxConcurrentDownloads := `level=debug msg="Max Concurrent Downloads: 8"`
 	content, err := s.d.ReadLogFile()
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentUploads))
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentDownloads))
-	err = os.WriteFile(configFilePath, []byte(`{ "max-concurrent-uploads" : 7, "max-concurrent-downloads" : 9 }`), 0666)
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentUploads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentDownloads))
+	err = os.WriteFile(configFilePath, []byte(`{ "max-concurrent-uploads" : 7, "max-concurrent-downloads" : 9 }`), 0o666)
 	assert.NilError(c, err)
-	assert.Assert(c, s.d.Signal(unix.SIGHUP) == nil)
+	assert.NilError(c, s.d.Signal(unix.SIGHUP))
 	// unix.Kill(s.d.cmd.Process.Pid, unix.SIGHUP)
 
 	time.Sleep(3 * time.Second)
@@ -2142,8 +2036,8 @@ func (s *DockerDaemonSuite) TestDaemonMaxConcurrencyWithConfigFile(c *testing.T)
 	expectedMaxConcurrentDownloads = `level=debug msg="Reset Max Concurrent Downloads: 9"`
 	content, err = s.d.ReadLogFile()
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentUploads))
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentDownloads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentUploads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentDownloads))
 }
 
 // Test case for #20936, #22443
@@ -2154,7 +2048,7 @@ func (s *DockerDaemonSuite) TestDaemonMaxConcurrencyWithConfigFileReload(c *test
 
 	// daemon config file
 	const configFilePath = "test-daemon.json"
-	err := os.WriteFile(configFilePath, []byte(`{ "max-concurrent-uploads" : null }`), 0666)
+	err := os.WriteFile(configFilePath, []byte(`{ "max-concurrent-uploads" : null }`), 0o666)
 	assert.NilError(c, err)
 	defer os.Remove(configFilePath)
 
@@ -2164,12 +2058,12 @@ func (s *DockerDaemonSuite) TestDaemonMaxConcurrencyWithConfigFileReload(c *test
 	expectedMaxConcurrentDownloads := `level=debug msg="Max Concurrent Downloads: 3"`
 	content, err := s.d.ReadLogFile()
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentUploads))
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentDownloads))
-	err = os.WriteFile(configFilePath, []byte(`{ "max-concurrent-uploads" : 1, "max-concurrent-downloads" : null }`), 0666)
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentUploads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentDownloads))
+	err = os.WriteFile(configFilePath, []byte(`{ "max-concurrent-uploads" : 1, "max-concurrent-downloads" : null }`), 0o666)
 	assert.NilError(c, err)
 
-	assert.Assert(c, s.d.Signal(unix.SIGHUP) == nil)
+	assert.NilError(c, s.d.Signal(unix.SIGHUP))
 	// unix.Kill(s.d.cmd.Process.Pid, unix.SIGHUP)
 
 	time.Sleep(3 * time.Second)
@@ -2178,12 +2072,12 @@ func (s *DockerDaemonSuite) TestDaemonMaxConcurrencyWithConfigFileReload(c *test
 	expectedMaxConcurrentDownloads = `level=debug msg="Reset Max Concurrent Downloads: 3"`
 	content, err = s.d.ReadLogFile()
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentUploads))
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentDownloads))
-	err = os.WriteFile(configFilePath, []byte(`{ "labels":["foo=bar"] }`), 0666)
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentUploads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentDownloads))
+	err = os.WriteFile(configFilePath, []byte(`{ "labels":["foo=bar"] }`), 0o666)
 	assert.NilError(c, err)
 
-	assert.Assert(c, s.d.Signal(unix.SIGHUP) == nil)
+	assert.NilError(c, s.d.Signal(unix.SIGHUP))
 
 	time.Sleep(3 * time.Second)
 
@@ -2191,8 +2085,8 @@ func (s *DockerDaemonSuite) TestDaemonMaxConcurrencyWithConfigFileReload(c *test
 	expectedMaxConcurrentDownloads = `level=debug msg="Reset Max Concurrent Downloads: 3"`
 	content, err = s.d.ReadLogFile()
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentUploads))
-	assert.Assert(c, strings.Contains(string(content), expectedMaxConcurrentDownloads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentUploads))
+	assert.Assert(c, is.Contains(string(content), expectedMaxConcurrentDownloads))
 }
 
 func (s *DockerDaemonSuite) TestBuildOnDisabledBridgeNetworkDaemon(c *testing.T) {
@@ -2273,7 +2167,7 @@ func (s *DockerDaemonSuite) TestRunWithRuntimeFromConfigFile(c *testing.T) {
 }
 `
 	os.WriteFile(configName, []byte(config), 0o644)
-	assert.Assert(c, s.d.Signal(unix.SIGHUP) == nil)
+	assert.NilError(c, s.d.Signal(unix.SIGHUP))
 	// Give daemon time to reload config
 	<-time.After(1 * time.Second)
 
@@ -2300,7 +2194,7 @@ func (s *DockerDaemonSuite) TestRunWithRuntimeFromConfigFile(c *testing.T) {
 }
 `
 	os.WriteFile(configName, []byte(config), 0o644)
-	assert.Assert(c, s.d.Signal(unix.SIGHUP) == nil)
+	assert.NilError(c, s.d.Signal(unix.SIGHUP))
 	// Give daemon time to reload config
 	<-time.After(1 * time.Second)
 
@@ -2325,7 +2219,7 @@ func (s *DockerDaemonSuite) TestRunWithRuntimeFromConfigFile(c *testing.T) {
 }
 `
 	os.WriteFile(configName, []byte(config), 0o644)
-	assert.Assert(c, s.d.Signal(unix.SIGHUP) == nil)
+	assert.NilError(c, s.d.Signal(unix.SIGHUP))
 	// Give daemon time to reload config
 	<-time.After(1 * time.Second)
 
@@ -2438,7 +2332,7 @@ func (s *DockerDaemonSuite) TestDaemonRestartSaveContainerExitCode(c *testing.T)
 	errMsg1, err := s.d.Cmd("inspect", "-f", "{{.State.Error}}", containerName)
 	errMsg1 = strings.TrimSpace(errMsg1)
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(errMsg1, "executable file not found"))
+	assert.Assert(c, is.Contains(errMsg1, "executable file not found"))
 	// now restart daemon
 	s.d.Restart(c)
 
@@ -2502,7 +2396,7 @@ func (s *DockerDaemonSuite) TestDaemonShutdownTimeout(c *testing.T) {
 	_, err := s.d.Cmd("run", "-d", "busybox", "top")
 	assert.NilError(c, err)
 
-	assert.Assert(c, s.d.Signal(unix.SIGINT) == nil)
+	assert.NilError(c, s.d.Signal(unix.SIGINT))
 
 	select {
 	case <-s.d.Wait:
@@ -2512,7 +2406,7 @@ func (s *DockerDaemonSuite) TestDaemonShutdownTimeout(c *testing.T) {
 	expectedMessage := `level=debug msg="daemon configured with a 3 seconds minimum shutdown timeout"`
 	content, err := s.d.ReadLogFile()
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(string(content), expectedMessage))
+	assert.Assert(c, is.Contains(string(content), expectedMessage))
 }
 
 // Test case for #22471
@@ -2521,16 +2415,16 @@ func (s *DockerDaemonSuite) TestDaemonShutdownTimeoutWithConfigFile(c *testing.T
 
 	// daemon config file
 	const configFilePath = "test-daemon.json"
-	err := os.WriteFile(configFilePath, []byte(`{ "shutdown-timeout" : 8 }`), 0666)
+	err := os.WriteFile(configFilePath, []byte(`{ "shutdown-timeout" : 8 }`), 0o666)
 	assert.NilError(c, err)
 	defer os.Remove(configFilePath)
 
 	s.d.Start(c, fmt.Sprintf("--config-file=%s", configFilePath))
 
-	err = os.WriteFile(configFilePath, []byte(`{ "shutdown-timeout" : 5 }`), 0666)
+	err = os.WriteFile(configFilePath, []byte(`{ "shutdown-timeout" : 5 }`), 0o666)
 	assert.NilError(c, err)
 
-	assert.Assert(c, s.d.Signal(unix.SIGHUP) == nil)
+	assert.NilError(c, s.d.Signal(unix.SIGHUP))
 
 	select {
 	case <-s.d.Wait:
@@ -2540,7 +2434,7 @@ func (s *DockerDaemonSuite) TestDaemonShutdownTimeoutWithConfigFile(c *testing.T
 	expectedMessage := `level=debug msg="Reset Shutdown Timeout: 5"`
 	content, err := s.d.ReadLogFile()
 	assert.NilError(c, err)
-	assert.Assert(c, strings.Contains(string(content), expectedMessage))
+	assert.Assert(c, is.Contains(string(content), expectedMessage))
 }
 
 // Test case for 29342

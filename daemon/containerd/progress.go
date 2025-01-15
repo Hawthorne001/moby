@@ -3,17 +3,20 @@ package containerd
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	cerrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/pkg/snapshotters"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/distribution/reference"
-	"github.com/docker/docker/internal/compatcontext"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/opencontainers/go-digest"
@@ -55,7 +58,7 @@ func (j *jobs) showProgress(ctx context.Context, out progress.Output, updater pr
 					}
 				}
 			case <-ctx.Done():
-				ctx, cancel := context.WithTimeout(compatcontext.WithoutCancel(ctx), time.Millisecond*500)
+				ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Millisecond*500)
 				defer cancel()
 				updater.UpdateProgress(ctx, j, out, start)
 				close(lastUpdate)
@@ -107,12 +110,15 @@ func (j *jobs) Jobs() []ocispec.Descriptor {
 }
 
 type pullProgress struct {
-	store      content.Store
-	showExists bool
-	hideLayers bool
+	store       content.Store
+	showExists  bool
+	hideLayers  bool
+	snapshotter snapshots.Snapshotter
+	layers      []ocispec.Descriptor
+	unpackStart map[digest.Digest]time.Time
 }
 
-func (p pullProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out progress.Output, start time.Time) error {
+func (p *pullProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out progress.Output, start time.Time) error {
 	actives, err := p.store.ListStatuses(ctx, "")
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -157,24 +163,93 @@ func (p pullProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out pro
 				ID:         stringid.TruncateID(j.Digest.Encoded()),
 				Action:     "Download complete",
 				HideCounts: true,
-				LastUpdate: true,
 			})
+			p.finished(ctx, out, j)
 			ongoing.Remove(j)
 		} else if p.showExists {
 			out.WriteProgress(progress.Progress{
 				ID:         stringid.TruncateID(j.Digest.Encoded()),
 				Action:     "Already exists",
 				HideCounts: true,
-				LastUpdate: true,
 			})
+			p.finished(ctx, out, j)
 			ongoing.Remove(j)
 		}
 	}
+
+	var committedIdx []int
+	for idx, desc := range p.layers {
+		// Find the snapshot corresponding to this layer
+		walkFilter := "labels.\"" + snapshotters.TargetLayerDigestLabel + "\"==" + p.layers[idx].Digest.String()
+
+		err := p.snapshotter.Walk(ctx, func(ctx context.Context, sn snapshots.Info) error {
+			if sn.Kind == snapshots.KindActive {
+				if p.unpackStart == nil {
+					p.unpackStart = make(map[digest.Digest]time.Time)
+				}
+				var seconds int64
+				if began, ok := p.unpackStart[desc.Digest]; !ok {
+					p.unpackStart[desc.Digest] = time.Now()
+				} else {
+					seconds = int64(time.Since(began).Seconds())
+				}
+
+				// We _could_ get the current size of snapshot by calling Usage, but this is too expensive
+				// and could impact performance. So we just show the "Extracting" message with the elapsed time as progress.
+				out.WriteProgress(
+					progress.Progress{
+						ID:     stringid.TruncateID(desc.Digest.Encoded()),
+						Action: "Extracting",
+						// Start from 1s, because without Total, 0 won't be shown at all.
+						Current: 1 + seconds,
+						Units:   "s",
+					})
+				return nil
+			}
+
+			if sn.Kind == snapshots.KindCommitted {
+				out.WriteProgress(progress.Progress{
+					ID:         stringid.TruncateID(desc.Digest.Encoded()),
+					Action:     "Pull complete",
+					HideCounts: true,
+					LastUpdate: true,
+				})
+
+				committedIdx = append(committedIdx, idx)
+				return nil
+			}
+			return nil
+		}, walkFilter)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Remove finished/committed layers from p.layers
+	if len(committedIdx) > 0 {
+		sort.Ints(committedIdx)
+		for i := len(committedIdx) - 1; i >= 0; i-- {
+			p.layers = append(p.layers[:committedIdx[i]], p.layers[committedIdx[i]+1:]...)
+		}
+	}
+
 	return nil
 }
 
+func (p *pullProgress) finished(ctx context.Context, out progress.Output, desc ocispec.Descriptor) {
+	if c8dimages.IsLayerType(desc.MediaType) {
+		p.layers = append(p.layers, desc)
+	}
+}
+
 type pushProgress struct {
-	Tracker docker.StatusTracker
+	Tracker                         docker.StatusTracker
+	notStartedWaitingAreUnavailable atomic.Bool
+}
+
+// TurnNotStartedIntoUnavailable will mark all not started layers as "Unavailable" instead of "Waiting".
+func (p *pushProgress) TurnNotStartedIntoUnavailable() {
+	p.notStartedWaitingAreUnavailable.Store(true)
 }
 
 func (p *pushProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out progress.Output, start time.Time) error {
@@ -183,7 +258,13 @@ func (p *pushProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out pr
 		id := stringid.TruncateID(j.Digest.Encoded())
 
 		status, err := p.Tracker.GetStatus(key)
-		if err != nil {
+
+		notStarted := (status.Total > 0 && status.Offset == 0)
+		if err != nil || notStarted {
+			if p.notStartedWaitingAreUnavailable.Load() {
+				progress.Update(out, id, "Unavailable")
+				continue
+			}
 			if cerrdefs.IsNotFound(err) {
 				progress.Update(out, id, "Waiting")
 				continue
@@ -198,7 +279,7 @@ func (p *pushProgress) UpdateProgress(ctx context.Context, ongoing *jobs, out pr
 				}
 				progress.Update(out, id, "Mounted from "+from)
 			} else if status.Exists {
-				if images.IsLayerType(j.MediaType) {
+				if c8dimages.IsLayerType(j.MediaType) {
 					progress.Update(out, id, "Layer already exists")
 				} else {
 					progress.Update(out, id, "Already exists")

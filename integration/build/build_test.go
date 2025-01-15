@@ -3,14 +3,18 @@ package build // import "github.com/docker/docker/integration/build"
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/jsonmessage"
@@ -24,7 +28,7 @@ import (
 func TestBuildWithRemoveAndForceRemove(t *testing.T) {
 	ctx := setupTest(t)
 
-	cases := []struct {
+	tests := []struct {
 		name                           string
 		dockerfile                     string
 		numberOfIntermediateContainers int
@@ -88,12 +92,11 @@ func TestBuildWithRemoveAndForceRemove(t *testing.T) {
 	}
 
 	client := testEnv.APIClient()
-	for _, c := range cases {
-		c := c
-		t.Run(c.name, func(t *testing.T) {
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := testutil.StartSpan(ctx, t)
-			dockerfile := []byte(c.dockerfile)
+			dockerfile := []byte(tc.dockerfile)
 
 			buff := bytes.NewBuffer(nil)
 			tw := tar.NewWriter(buff)
@@ -104,14 +107,14 @@ func TestBuildWithRemoveAndForceRemove(t *testing.T) {
 			_, err := tw.Write(dockerfile)
 			assert.NilError(t, err)
 			assert.NilError(t, tw.Close())
-			resp, err := client.ImageBuild(ctx, buff, types.ImageBuildOptions{Remove: c.rm, ForceRemove: c.forceRm, NoCache: true})
+			resp, err := client.ImageBuild(ctx, buff, types.ImageBuildOptions{Remove: tc.rm, ForceRemove: tc.forceRm, NoCache: true})
 			assert.NilError(t, err)
 			defer resp.Body.Close()
 			filter, err := buildContainerIdsFilter(resp.Body)
 			assert.NilError(t, err)
 			remainingContainers, err := client.ContainerList(ctx, container.ListOptions{Filters: filter, All: true})
 			assert.NilError(t, err)
-			assert.Equal(t, c.numberOfIntermediateContainers, len(remainingContainers), "Expected %v remaining intermediate containers, got %v", c.numberOfIntermediateContainers, len(remainingContainers))
+			assert.Equal(t, tc.numberOfIntermediateContainers, len(remainingContainers), "Expected %v remaining intermediate containers, got %v", tc.numberOfIntermediateContainers, len(remainingContainers))
 		})
 	}
 }
@@ -609,7 +612,6 @@ func TestBuildWithEmptyDockerfile(t *testing.T) {
 	apiClient := testEnv.APIClient()
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -626,7 +628,7 @@ func TestBuildWithEmptyDockerfile(t *testing.T) {
 					ForceRemove: true,
 				})
 
-			assert.Check(t, is.Contains(err.Error(), tc.expectedErr))
+			assert.Check(t, is.ErrorContains(err, tc.expectedErr))
 		})
 	}
 }
@@ -687,6 +689,136 @@ func TestBuildPlatformInvalid(t *testing.T) {
 
 	assert.Check(t, is.ErrorContains(err, "unknown operating system or architecture"))
 	assert.Check(t, is.ErrorType(err, errdefs.IsInvalidParameter))
+}
+
+// TestBuildWorkdirNoCacheMiss is a regression test for https://github.com/moby/moby/issues/47627
+func TestBuildWorkdirNoCacheMiss(t *testing.T) {
+	ctx := setupTest(t)
+
+	for _, tc := range []struct {
+		name       string
+		dockerfile string
+	}{
+		{name: "trailing slash", dockerfile: "FROM busybox\nWORKDIR /foo/"},
+		{name: "no trailing slash", dockerfile: "FROM busybox\nWORKDIR /foo"},
+	} {
+		dockerfile := tc.dockerfile
+		t.Run(tc.name, func(t *testing.T) {
+			source := fakecontext.New(t, "", fakecontext.WithDockerfile(dockerfile))
+			defer source.Close()
+
+			apiClient := testEnv.APIClient()
+
+			buildAndGetID := func() string {
+				resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), types.ImageBuildOptions{
+					Version: types.BuilderV1,
+				})
+				assert.NilError(t, err)
+				defer resp.Body.Close()
+
+				id := readBuildImageIDs(t, resp.Body)
+				assert.Check(t, id != "")
+				return id
+			}
+
+			firstId := buildAndGetID()
+			secondId := buildAndGetID()
+
+			assert.Check(t, is.Equal(firstId, secondId), "expected cache to be used")
+		})
+	}
+}
+
+func TestBuildEmitsImageCreateEvent(t *testing.T) {
+	ctx := setupTest(t)
+
+	dockerfile := "FROM busybox\nRUN echo hello > /hello"
+	source := fakecontext.New(t, "", fakecontext.WithDockerfile(dockerfile))
+	defer source.Close()
+
+	apiClient := testEnv.APIClient()
+
+	for _, builderVersion := range []types.BuilderVersion{types.BuilderV1, types.BuilderBuildKit} {
+		t.Run("v"+string(builderVersion), func(t *testing.T) {
+			if builderVersion == types.BuilderBuildKit {
+				skip.If(t, testEnv.UsingSnapshotter(),
+					"FIXME: Passing a context via a tarball is not supported with the containerd image store. See: https://github.com/moby/moby/issues/47717")
+				skip.If(t, testEnv.DaemonInfo.OSType == "windows", "Buildkit is not supported on Windows")
+			}
+
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			since := time.Now()
+
+			resp, err := apiClient.ImageBuild(ctx, source.AsTarReader(t), types.ImageBuildOptions{
+				Version: builderVersion,
+				NoCache: true,
+			})
+			assert.NilError(t, err)
+
+			defer resp.Body.Close()
+
+			out := bytes.NewBuffer(nil)
+			_, err = io.Copy(out, resp.Body)
+			assert.NilError(t, err)
+			buildLogs := out.String()
+
+			eventsChan, errs := apiClient.Events(ctx, events.ListOptions{
+				Since: since.Format(time.RFC3339Nano),
+				Until: time.Now().Format(time.RFC3339Nano),
+			})
+
+			var eventsReceived []string
+			imageCreateEvts := 0
+			finished := false
+			for !finished {
+				select {
+				case evt := <-eventsChan:
+					eventsReceived = append(eventsReceived, fmt.Sprintf("type: %v, action: %v", evt.Type, evt.Action))
+					if evt.Type == events.ImageEventType && evt.Action == events.ActionCreate {
+						imageCreateEvts++
+					}
+				case err := <-errs:
+					assert.Check(t, err == nil || err == io.EOF)
+					finished = true
+				}
+			}
+
+			if !assert.Check(t, is.Equal(1, imageCreateEvts)) {
+				t.Logf("build-logs:\n%s", buildLogs)
+				t.Logf("events received:\n%s", strings.Join(eventsReceived, "\n"))
+			}
+		})
+	}
+}
+
+func readBuildImageIDs(t *testing.T, rd io.Reader) string {
+	t.Helper()
+	decoder := json.NewDecoder(rd)
+	for {
+		var jm jsonmessage.JSONMessage
+		if err := decoder.Decode(&jm); err != nil {
+			if err == io.EOF {
+				break
+			}
+			assert.NilError(t, err)
+		}
+
+		if jm.Aux == nil {
+			continue
+		}
+
+		var auxId struct {
+			ID string `json:"ID"`
+		}
+
+		if json.Unmarshal(*jm.Aux, &auxId); auxId.ID != "" {
+			return auxId.ID
+		}
+	}
+
+	return ""
 }
 
 func writeTarRecord(t *testing.T, w *tar.Writer, fn, contents string) {

@@ -5,31 +5,30 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 
 	cdcgroups "github.com/containerd/cgroups/v3"
-	"github.com/containerd/containerd/containers"
-	coci "github.com/containerd/containerd/oci"
-	"github.com/containerd/containerd/pkg/apparmor"
-	"github.com/containerd/containerd/pkg/userns"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/pkg/apparmor"
+	coci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/log"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
 	dconfig "github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/internal/rootless/mountopts"
+	"github.com/docker/docker/internal/rootless/specconv"
 	"github.com/docker/docker/oci"
 	"github.com/docker/docker/oci/caps"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/rootless/specconv"
 	volumemounts "github.com/docker/docker/volume/mounts"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"github.com/moby/sys/user"
+	"github.com/moby/sys/userns"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 )
 
@@ -155,7 +154,7 @@ func WithApparmor(c *container.Container) coci.SpecOpts {
 	}
 }
 
-// WithCapabilities sets the container's capabilties
+// WithCapabilities sets the container's capabilities
 func WithCapabilities(c *container.Container) coci.SpecOpts {
 	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) error {
 		capabilities, err := caps.TweakCapabilities(
@@ -477,11 +476,9 @@ func inSlice(slice []string, s string) bool {
 }
 
 // withMounts sets the container's mounts
-func withMounts(daemon *Daemon, daemonCfg *configStore, c *container.Container, ms []container.Mount) coci.SpecOpts {
+func withMounts(daemon *Daemon, daemonCfg *configStore, c *container.Container, mounts []container.Mount) coci.SpecOpts {
 	return func(ctx context.Context, _ coci.Client, _ *containers.Container, s *coci.Spec) (err error) {
-		sort.Sort(mounts(ms))
-
-		mounts := ms
+		sortMounts(mounts)
 
 		userMounts := make(map[string]struct{})
 		for _, m := range mounts {
@@ -802,15 +799,11 @@ func withCgroups(daemon *Daemon, daemonCfg *dconfig.Config, c *container.Contain
 
 		p := cgroupsPath
 		if useSystemd {
-			initPath, err := cgroups.GetInitCgroup("cpu")
+			path, err := cgroups.GetOwnCgroup("cpu")
 			if err != nil {
 				return errors.Wrap(err, "unable to init CPU RT controller")
 			}
-			_, err = cgroups.GetOwnCgroup("cpu")
-			if err != nil {
-				return errors.Wrap(err, "unable to init CPU RT controller")
-			}
-			p = filepath.Join(initPath, s.Linux.CgroupsPath)
+			p = filepath.Join(path, s.Linux.CgroupsPath)
 		}
 
 		// Clean path to guard against things like ../../../BAD

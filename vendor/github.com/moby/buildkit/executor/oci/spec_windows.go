@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package oci
 
@@ -10,9 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/continuity/fs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/solver/pb"
@@ -51,14 +50,14 @@ func withGetUserInfoMount() oci.SpecOpts {
 	}
 }
 
-func generateMountOpts(resolvConf, hostsFile string) ([]oci.SpecOpts, error) {
+func generateMountOpts(_, _ string) []oci.SpecOpts {
 	return []oci.SpecOpts{
 		withGetUserInfoMount(),
-	}, nil
+	}
 }
 
 // generateSecurityOpts may affect mounts, so must be called after generateMountOpts
-func generateSecurityOpts(mode pb.SecurityMode, apparmorProfile string, selinuxB bool) ([]oci.SpecOpts, error) {
+func generateSecurityOpts(mode pb.SecurityMode, _ string, _ bool) ([]oci.SpecOpts, error) {
 	if mode == pb.SecurityMode_INSECURE {
 		return nil, errors.New("no support for running in insecure mode on Windows")
 	}

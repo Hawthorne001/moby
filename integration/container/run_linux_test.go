@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/versions"
@@ -185,7 +184,7 @@ func TestRunConsoleSize(t *testing.T) {
 		container.WithConsoleSize(57, 123),
 	)
 
-	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID))
 
 	out, err := apiClient.ContainerLogs(ctx, cID, containertypes.LogsOptions{ShowStdout: true})
 	assert.NilError(t, err)
@@ -230,7 +229,7 @@ func TestRunWithAlternativeContainerdShim(t *testing.T) {
 		container.WithRuntime("io.containerd.realfake.v42"),
 	)
 
-	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID))
 
 	out, err := apiClient.ContainerLogs(ctx, cID, containertypes.LogsOptions{ShowStdout: true})
 	assert.NilError(t, err)
@@ -250,7 +249,7 @@ func TestRunWithAlternativeContainerdShim(t *testing.T) {
 		container.WithCmd("sh", "-c", `echo 'Hello, world!'`),
 	)
 
-	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID))
 
 	out, err = apiClient.ContainerLogs(ctx, cID, containertypes.LogsOptions{ShowStdout: true})
 	assert.NilError(t, err)
@@ -314,7 +313,7 @@ func TestStaticIPOutsideSubpool(t *testing.T) {
 		container.WithIPv4(netname, "10.42.1.3"),
 	)
 
-	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsStopped(ctx, apiClient, cID))
 
 	out, err := apiClient.ContainerLogs(ctx, cID, containertypes.LogsOptions{ShowStdout: true})
 	assert.NilError(t, err)
@@ -325,4 +324,78 @@ func TestStaticIPOutsideSubpool(t *testing.T) {
 	assert.NilError(t, err)
 
 	assert.Check(t, is.Contains(b.String(), "inet 10.42.1.3/16"))
+}
+
+func TestWorkingDirNormalization(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	for _, tc := range []struct {
+		name    string
+		workdir string
+	}{
+		{name: "trailing slash", workdir: "/tmp/"},
+		{name: "no trailing slash", workdir: "/tmp"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cID := container.Run(ctx, t, apiClient,
+				container.WithImage("busybox"),
+				container.WithWorkingDir(tc.workdir),
+			)
+
+			defer container.Remove(ctx, t, apiClient, cID, containertypes.RemoveOptions{Force: true})
+
+			inspect := container.Inspect(ctx, t, apiClient, cID)
+
+			assert.Check(t, is.Equal(inspect.Config.WorkingDir, "/tmp"))
+		})
+	}
+}
+
+func TestSeccomp(t *testing.T) {
+	skip.If(t, testEnv.DaemonInfo.OSType != "linux")
+
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	const confined = `{
+ "defaultAction": "SCMP_ACT_ALLOW",
+ "syscalls": [ { "names": [ "chown", "chown32", "fchownat" ], "action": "SCMP_ACT_ERRNO" } ]
+}
+`
+	type testCase struct {
+		ops              []func(*container.TestContainerConfig)
+		expectedExitCode int
+	}
+	testCases := []testCase{
+		{
+			ops:              nil,
+			expectedExitCode: 0,
+		},
+		{
+			ops:              []func(*container.TestContainerConfig){container.WithPrivileged(true)},
+			expectedExitCode: 0,
+		},
+		{
+			ops:              []func(*container.TestContainerConfig){container.WithSecurityOpt("seccomp=" + confined)},
+			expectedExitCode: 1,
+		},
+		{
+			// A custom profile should be still enabled, even when --privileged is set
+			// https://github.com/moby/moby/issues/47499
+			ops:              []func(*container.TestContainerConfig){container.WithPrivileged(true), container.WithSecurityOpt("seccomp=" + confined)},
+			expectedExitCode: 1,
+		},
+	}
+	for _, tc := range testCases {
+		cID := container.Run(ctx, t, apiClient, tc.ops...)
+		res, err := container.Exec(ctx, apiClient, cID, []string{"chown", "42", "/bin/true"})
+		assert.NilError(t, err)
+		assert.Equal(t, tc.expectedExitCode, res.ExitCode)
+		if tc.expectedExitCode != 0 {
+			assert.Check(t, is.Contains(res.Stderr(), "Operation not permitted"))
+		}
+	}
 }

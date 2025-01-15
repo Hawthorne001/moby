@@ -7,11 +7,13 @@ import (
 	nethttp "net/http"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/rootfs"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/gc"
+	"github.com/containerd/containerd/v2/pkg/rootfs"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/containerd/platforms"
 	imageadapter "github.com/docker/docker/builder/builder-next/adapters/containerimage"
 	mobyexporter "github.com/docker/docker/builder/builder-next/exporter"
 	distmetadata "github.com/docker/docker/distribution/metadata"
@@ -76,6 +78,7 @@ type Opt struct {
 	ContentStore      *containerdsnapshot.Store
 	CacheManager      cache.Manager
 	LeaseManager      *leaseutil.Manager
+	GarbageCollect    func(context.Context) (gc.Stats, error)
 	ImageSource       *imageadapter.Source
 	DownloadManager   *xfer.LayerDownloadManager
 	V2MetadataService distmetadata.V2MetadataService
@@ -181,6 +184,14 @@ func (w *Worker) BuildkitVersion() client.BuildkitVersion {
 		Version:  version.Version + "-moby",
 		Revision: version.Revision,
 	}
+}
+
+func (w *Worker) GarbageCollect(ctx context.Context) error {
+	if w.Opt.GarbageCollect == nil {
+		return nil
+	}
+	_, err := w.Opt.GarbageCollect(ctx)
+	return err
 }
 
 // Close closes the worker and releases all resources
@@ -340,7 +351,7 @@ func (w *Worker) GetRemotes(ctx context.Context, ref cache.ImmutableRef, createI
 	descriptors := make([]ocispec.Descriptor, len(diffIDs))
 	for i, dgst := range diffIDs {
 		descriptors[i] = ocispec.Descriptor{
-			MediaType: images.MediaTypeDockerSchema2Layer,
+			MediaType: c8dimages.MediaTypeDockerSchema2Layer,
 			Digest:    digest.Digest(dgst),
 			Size:      -1,
 		}
@@ -353,13 +364,13 @@ func (w *Worker) GetRemotes(ctx context.Context, ref cache.ImmutableRef, createI
 }
 
 // PruneCacheMounts removes the current cache snapshots for specified IDs
-func (w *Worker) PruneCacheMounts(ctx context.Context, ids []string) error {
+func (w *Worker) PruneCacheMounts(ctx context.Context, ids map[string]bool) error {
 	mu := mounts.CacheMountsLocker()
 	mu.Lock()
 	defer mu.Unlock()
 
-	for _, id := range ids {
-		mds, err := mounts.SearchCacheDir(ctx, w.CacheManager(), id)
+	for id, nested := range ids {
+		mds, err := mounts.SearchCacheDir(ctx, w.CacheManager(), id, nested)
 		if err != nil {
 			return err
 		}
@@ -572,5 +583,5 @@ func (p *emptyProvider) ReaderAt(ctx context.Context, dec ocispec.Descriptor) (c
 }
 
 func (p *emptyProvider) Info(ctx context.Context, d digest.Digest) (content.Info, error) {
-	return content.Info{}, errors.Errorf("Info not implemented for empty provider")
+	return content.Info{}, errors.Wrapf(cerrdefs.ErrNotImplemented, "Info not implemented for empty provider")
 }
