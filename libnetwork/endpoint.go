@@ -1,5 +1,5 @@
 // FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
-//go:build go1.19
+//go:build go1.22
 
 package libnetwork
 
@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
+	"strings"
 	"sync"
 
 	"github.com/containerd/log"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/internal/sliceutil"
 	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/docker/libnetwork/ipamapi"
@@ -18,6 +21,7 @@ import (
 	"github.com/docker/docker/libnetwork/options"
 	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/libnetwork/types"
+	"go.opentelemetry.io/otel"
 )
 
 // ByNetworkType sorts a [Endpoint] slice based on the network-type
@@ -79,6 +83,7 @@ type Endpoint struct {
 	// will be used for the PTR records associated to the endpoint's IPv4 and IPv6 addresses.
 	dnsNames          []string
 	disableResolution bool
+	disableIPv6       bool
 	generic           map[string]interface{}
 	prefAddress       net.IP
 	prefAddressV6     net.IP
@@ -112,6 +117,7 @@ func (ep *Endpoint) MarshalJSON() ([]byte, error) {
 	epMap["sandbox"] = ep.sandboxID
 	epMap["dnsNames"] = ep.dnsNames
 	epMap["disableResolution"] = ep.disableResolution
+	epMap["disableIPv6"] = ep.disableIPv6
 	epMap["svcName"] = ep.svcName
 	epMap["svcID"] = ep.svcID
 	epMap["virtualIP"] = ep.virtualIP.String()
@@ -208,6 +214,9 @@ func (ep *Endpoint) UnmarshalJSON(b []byte) (err error) {
 	if v, ok := epMap["disableResolution"]; ok {
 		ep.disableResolution = v.(bool)
 	}
+	if v, ok := epMap["disableIPv6"]; ok {
+		ep.disableIPv6 = v.(bool)
+	}
 
 	if sn, ok := epMap["svcName"]; ok {
 		ep.svcName = sn.(string)
@@ -273,6 +282,7 @@ func (ep *Endpoint) CopyTo(o datastore.KVObject) error {
 	dstEp.dbIndex = ep.dbIndex
 	dstEp.dbExists = ep.dbExists
 	dstEp.disableResolution = ep.disableResolution
+	dstEp.disableIPv6 = ep.disableIPv6
 	dstEp.svcName = ep.svcName
 	dstEp.svcID = ep.svcID
 	dstEp.virtualIP = ep.virtualIP
@@ -400,6 +410,18 @@ func (ep *Endpoint) Value() []byte {
 	return b
 }
 
+func (ep *Endpoint) getSysctls() []string {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	if s, ok := ep.generic[netlabel.EndpointSysctls]; ok {
+		if ss, ok := s.(string); ok {
+			return strings.Split(ss, ",")
+		}
+	}
+	return nil
+}
+
 func (ep *Endpoint) SetValue(value []byte) error {
 	return json.Unmarshal(value, ep)
 }
@@ -455,7 +477,7 @@ func (ep *Endpoint) getNetworkFromStore() (*Network, error) {
 
 // Join joins the sandbox to the endpoint and populates into the sandbox
 // the network resources allocated for the endpoint.
-func (ep *Endpoint) Join(sb *Sandbox, options ...EndpointOption) error {
+func (ep *Endpoint) Join(ctx context.Context, sb *Sandbox, options ...EndpointOption) error {
 	if sb == nil || sb.ID() == "" || sb.Key() == "" {
 		return types.InvalidParameterErrorf("invalid Sandbox passed to endpoint join: %v", sb)
 	}
@@ -463,10 +485,13 @@ func (ep *Endpoint) Join(sb *Sandbox, options ...EndpointOption) error {
 	sb.joinLeaveStart()
 	defer sb.joinLeaveEnd()
 
-	return ep.sbJoin(sb, options...)
+	return ep.sbJoin(ctx, sb, options...)
 }
 
-func (ep *Endpoint) sbJoin(sb *Sandbox, options ...EndpointOption) (err error) {
+func (ep *Endpoint) sbJoin(ctx context.Context, sb *Sandbox, options ...EndpointOption) (retErr error) {
+	ctx, span := otel.Tracer("").Start(ctx, "libnetwork.sbJoin")
+	defer span.End()
+
 	n, err := ep.getNetworkFromStore()
 	if err != nil {
 		return fmt.Errorf("failed to get network from store during join: %v", err)
@@ -476,6 +501,13 @@ func (ep *Endpoint) sbJoin(sb *Sandbox, options ...EndpointOption) (err error) {
 	if err != nil {
 		return fmt.Errorf("failed to get endpoint from store during join: %v", err)
 	}
+
+	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(log.Fields{
+		"nid": n.ID(),
+		"net": n.Name(),
+		"eid": ep.ID(),
+		"ep":  ep.Name(),
+	}))
 
 	ep.mu.Lock()
 	if ep.sandboxID != "" {
@@ -488,7 +520,7 @@ func (ep *Endpoint) sbJoin(sb *Sandbox, options ...EndpointOption) (err error) {
 	epid := ep.id
 	ep.mu.Unlock()
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			ep.mu.Lock()
 			ep.sandboxID = ""
 			ep.mu.Unlock()
@@ -504,57 +536,64 @@ func (ep *Endpoint) sbJoin(sb *Sandbox, options ...EndpointOption) (err error) {
 		return fmt.Errorf("failed to get driver during join: %v", err)
 	}
 
-	err = d.Join(nid, epid, sb.Key(), ep, sb.Labels())
-	if err != nil {
+	if err := d.Join(ctx, nid, epid, sb.Key(), ep, sb.Labels()); err != nil {
 		return err
 	}
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			if e := d.Leave(nid, epid); e != nil {
-				log.G(context.TODO()).Warnf("driver leave failed while rolling back join: %v", e)
+				log.G(ctx).Warnf("driver leave failed while rolling back join: %v", e)
 			}
 		}
 	}()
 
+	// Discard the IPv6 gateway if the endpoint has no IPv6 address (because IPv6
+	// is disabled in the container).
+	if ep.iface.addrv6 == nil {
+		ep.joinInfo.gw6 = nil
+	}
+
 	if !n.getController().isAgent() {
 		if !n.getController().isSwarmNode() || n.Scope() != scope.Swarm || !n.driverIsMultihost() {
-			n.updateSvcRecord(ep, true)
+			n.updateSvcRecord(context.WithoutCancel(ctx), ep, true)
 		}
 	}
 
-	if err := sb.updateHostsFile(ep.getEtcHostsAddrs()); err != nil {
-		return err
-	}
-	if err = sb.updateDNS(n.enableIPv6); err != nil {
+	sb.addHostsEntries(ctx, ep.getEtcHostsAddrs())
+	if err := sb.updateDNS(n.enableIPv6); err != nil {
 		return err
 	}
 
-	// Current endpoint providing external connectivity for the sandbox
-	extEp := sb.getGatewayEndpoint()
+	// Current endpoint(s) providing external connectivity for the sandbox
+	gwepBefore4, gwepBefore6 := sb.getGatewayEndpoint()
 
 	sb.addEndpoint(ep)
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			sb.removeEndpoint(ep)
 		}
 	}()
 
-	if err = sb.populateNetworkResources(ep); err != nil {
+	if err := sb.populateNetworkResources(ctx, ep); err != nil {
 		return err
 	}
 
-	if err = n.getController().updateToStore(ep); err != nil {
+	if err := addEpToResolver(ctx, n.Name(), ep.Name(), &sb.config, ep.iface, n.Resolvers()); err != nil {
+		return errdefs.System(err)
+	}
+
+	if err := n.getController().updateToStore(ctx, ep); err != nil {
 		return err
 	}
 
-	if err = ep.addDriverInfoToCluster(); err != nil {
+	if err := ep.addDriverInfoToCluster(); err != nil {
 		return err
 	}
 
 	defer func() {
-		if err != nil {
+		if retErr != nil {
 			if e := ep.deleteDriverInfoFromCluster(); e != nil {
-				log.G(context.TODO()).Errorf("Could not delete endpoint state for endpoint %s from cluster on join failure: %v", ep.Name(), e)
+				log.G(ctx).WithError(e).Error("Could not delete endpoint state from cluster on join failure")
 			}
 		}
 	}()
@@ -569,56 +608,152 @@ func (ep *Endpoint) sbJoin(sb *Sandbox, options ...EndpointOption) (err error) {
 		return sb.setupDefaultGW()
 	}
 
-	currentExtEp := sb.getGatewayEndpoint()
 	// Enable upstream forwarding if the sandbox gained external connectivity.
 	if sb.resolver != nil {
-		sb.resolver.SetForwardingPolicy(currentExtEp != nil)
+		sb.resolver.SetForwardingPolicy(sb.hasExternalAccess())
 	}
 
-	moveExtConn := currentExtEp != extEp
-	if moveExtConn {
-		if extEp != nil {
-			log.G(context.TODO()).Debugf("Revoking external connectivity on endpoint %s (%s)", extEp.Name(), extEp.ID())
-			extN, err := extEp.getNetworkFromStore()
-			if err != nil {
-				return fmt.Errorf("failed to get network from store for revoking external connectivity during join: %v", err)
+	gwepAfter4, gwepAfter6 := sb.getGatewayEndpoint()
+	if ep == gwepAfter4 || ep == gwepAfter6 {
+		// When the driver programs external connectivity for a Sandbox to use an
+		// IPv4-only Endpoint, it may choose to map ports from host IPv6 addresses (as
+		// well as host IPv4) to the Endpoint's IPv4 address. But, it must not do that if
+		// there is an IPv6-only Endpoint acting as the IPv6 gateway.
+		//
+		// So, for an IPv4-only Endpoint acting as a gateway, "noProxy6To4=true" must be
+		// set if the Sandbox has a different Endpoint acting as IPv6 gateway. And, if ep
+		// becoming the gateway changes noProxy6To4, the IPv4 gateway must be reset.
+		//
+		// This happens naturally in most cases. For example, if ep is dual-stack, sb had
+		// an IPv4-only gateway and no IPv6 gateway - connectivity will be revoked from
+		// the original IPv4-only gateway Endpoint and given to ep. So the old gateway
+		// won't be mapping from the host-IPv6 address.
+		//
+		// But, if ep is IPv6 only, an existing IPv4 only gateway may be proxying 6To4.
+		// So, its connectivity needs to be revoked and re-added with noProxy6To4 set.
+		// Similarly, when an IPv6-only gateway is disconnected from the Sandbox,
+		// gwepAfter6 will become nil and noProxy6To4 needs to be cleared in the
+		// configuration of an IPv4-only gateway.
+		//
+		// Note that revoking/restoring external connectivity will result in the bridge
+		// driver assigning new host ports for port mappings where the host port is not
+		// specified.
+		noProxy6To4Before := gwepBefore4 != nil && gwepBefore6 != nil && gwepBefore4 != gwepBefore6
+		noProxy6To4After := gwepAfter4 != nil && gwepAfter6 != nil && gwepAfter4 != gwepAfter6
+		restartGw4 := ep != gwepAfter4 && noProxy6To4Before != noProxy6To4After
+
+		// If ep is the new IPv4 gateway, remove the old IPv4 gateway.
+		if gwepBefore4 != nil && (ep == gwepAfter4 || restartGw4) {
+			role := "IPv4"
+			if gwepAfter6 == gwepAfter4 {
+				role = "dual-stack"
 			}
-			extD, err := extN.driver(true)
+			log.G(ctx).WithFields(log.Fields{
+				"noProxy6To4": noProxy6To4Before,
+			}).Debug("Revoking external connectivity on endpoint")
+			undoFunc, err := gwepBefore4.revokeExternalConnectivity()
 			if err != nil {
-				return fmt.Errorf("failed to get driver for revoking external connectivity during join: %v", err)
+				return err
 			}
-			if err = extD.RevokeExternalConnectivity(extEp.network.ID(), extEp.ID()); err != nil {
-				return types.InternalErrorf(
-					"driver failed revoking external connectivity on endpoint %s (%s): %v",
-					extEp.Name(), extEp.ID(), err)
+			if restartGw4 {
+				// The IPv4 gateway hasn't changed, but its noProxy6To4 setting has. So,
+				// restore it as the gateway with that new setting.
+				log.G(ctx).WithFields(log.Fields{
+					"noProxy6To4": noProxy6To4After,
+					"role":        role,
+				}).Debug("Programming IPv4 gateway endpoint")
+				labelsAfter := sb.Labels()
+				labelsAfter[netlabel.NoProxy6To4] = noProxy6To4After
+				if err := undoFunc(ctx, labelsAfter); err != nil {
+					log.G(ctx).WithError(err).Warn("Failed to restore IPv4 connectivity")
+				}
+			} else {
+				defer func() {
+					if retErr != nil {
+						labelsBefore := sb.Labels()
+						labelsBefore[netlabel.NoProxy6To4] = noProxy6To4Before
+						if err := undoFunc(ctx, labelsBefore); err != nil {
+							log.G(ctx).WithError(err).Warn("Failed to restore connectivity during rollback")
+						}
+					}
+				}()
+			}
+		}
+		// If ep is the new IPv6 gateway, there's an old IPv6 gateway to remove, and it
+		// wasn't also the IPv4 gateway (removed already) - remove the old gateway.
+		if ep == gwepAfter6 && gwepBefore6 != nil && gwepBefore6 != gwepBefore4 {
+			log.G(ctx).Debug("Programming IPv6 gateway endpoint")
+			undoFunc, err := gwepBefore6.revokeExternalConnectivity()
+			if err != nil {
+				return err
 			}
 			defer func() {
-				if err != nil {
-					if e := extD.ProgramExternalConnectivity(extEp.network.ID(), extEp.ID(), sb.Labels()); e != nil {
-						log.G(context.TODO()).Warnf("Failed to roll-back external connectivity on endpoint %s (%s): %v",
-							extEp.Name(), extEp.ID(), e)
+				if retErr != nil {
+					if err := undoFunc(ctx, sb.Labels()); err != nil {
+						log.G(ctx).WithError(err).Warn("Failed to restore IPv6 connectivity during rollback")
 					}
 				}
 			}()
 		}
 		if !n.internal {
-			log.G(context.TODO()).Debugf("Programming external connectivity on endpoint %s (%s)", ep.Name(), ep.ID())
-			if err = d.ProgramExternalConnectivity(n.ID(), ep.ID(), sb.Labels()); err != nil {
-				return types.InternalErrorf(
+			log.G(ctx).Debugf("Programming external connectivity on endpoint")
+			labels := sb.Labels()
+			labels[netlabel.NoProxy6To4] = noProxy6To4After
+			if err := d.ProgramExternalConnectivity(ctx, n.ID(), ep.ID(), labels); err != nil {
+				return errdefs.System(fmt.Errorf(
 					"driver failed programming external connectivity on endpoint %s (%s): %v",
-					ep.Name(), ep.ID(), err)
+					ep.Name(), ep.ID(), err))
 			}
 		}
 	}
 
 	if !sb.needDefaultGW() {
 		if e := sb.clearDefaultGW(); e != nil {
-			log.G(context.TODO()).Warnf("Failure while disconnecting sandbox %s (%s) from gateway network: %v",
-				sb.ID(), sb.ContainerID(), e)
+			log.G(ctx).WithFields(log.Fields{
+				"error": e,
+				"sid":   sb.ID(),
+				"cid":   sb.ContainerID(),
+			}).Warn("Failure while disconnecting sandbox from gateway network")
 		}
 	}
 
 	return nil
+}
+
+func (ep *Endpoint) programExternalConnectivity(ctx context.Context, labels map[string]interface{}) error {
+	log.G(ctx).Debugf("Programming external connectivity on endpoint %s (%s)", ep.Name(), ep.ID())
+	extN, err := ep.getNetworkFromStore()
+	if err != nil {
+		return types.InternalErrorf("failed to get network from store for programming external connectivity: %v", err)
+	}
+	extD, err := extN.driver(true)
+	if err != nil {
+		return types.InternalErrorf("failed to get driver for programming external connectivity: %v", err)
+	}
+	if err := extD.ProgramExternalConnectivity(context.WithoutCancel(ctx), ep.network.ID(), ep.ID(), labels); err != nil {
+		return types.InternalErrorf("driver failed programming external connectivity on endpoint %s (%s): %v",
+			ep.Name(), ep.ID(), err)
+	}
+	return nil
+}
+
+func (ep *Endpoint) revokeExternalConnectivity() (func(context.Context, map[string]interface{}) error, error) {
+	extN, err := ep.getNetworkFromStore()
+	if err != nil {
+		return nil, types.InternalErrorf("failed to get network from store for revoking external connectivity: %v", err)
+	}
+	extD, err := extN.driver(true)
+	if err != nil {
+		return nil, types.InternalErrorf("failed to get driver for revoking external connectivity: %v", err)
+	}
+	if err = extD.RevokeExternalConnectivity(ep.network.ID(), ep.ID()); err != nil {
+		return nil, types.InternalErrorf(
+			"driver failed revoking external connectivity on endpoint %s (%s): %v",
+			ep.Name(), ep.ID(), err)
+	}
+	return func(ctx context.Context, labels map[string]interface{}) error {
+		return extD.ProgramExternalConnectivity(context.WithoutCancel(ctx), ep.network.ID(), ep.ID(), labels)
+	}, nil
 }
 
 func (ep *Endpoint) rename(name string) error {
@@ -627,7 +762,7 @@ func (ep *Endpoint) rename(name string) error {
 	ep.mu.Unlock()
 
 	// Update the store with the updated name
-	if err := ep.getNetwork().getController().updateToStore(ep); err != nil {
+	if err := ep.getNetwork().getController().updateToStore(context.TODO(), ep); err != nil {
 		return err
 	}
 
@@ -656,14 +791,14 @@ func (ep *Endpoint) UpdateDNSNames(dnsNames []string) error {
 			return types.InternalErrorf("could not add service state for endpoint %s to cluster on UpdateDNSNames: %v", ep.Name(), err)
 		}
 	} else {
-		nw.updateSvcRecord(ep, false)
+		nw.updateSvcRecord(context.WithoutCancel(context.TODO()), ep, false)
 
 		ep.dnsNames = dnsNames
-		nw.updateSvcRecord(ep, true)
+		nw.updateSvcRecord(context.WithoutCancel(context.TODO()), ep, true)
 	}
 
 	// Update the store with the updated name
-	if err := c.updateToStore(ep); err != nil {
+	if err := c.updateToStore(context.TODO(), ep); err != nil {
 		return err
 	}
 
@@ -678,7 +813,7 @@ func (ep *Endpoint) hasInterface(iName string) bool {
 }
 
 // Leave detaches the network resources populated in the sandbox.
-func (ep *Endpoint) Leave(sb *Sandbox) error {
+func (ep *Endpoint) Leave(ctx context.Context, sb *Sandbox) error {
 	if sb == nil || sb.ID() == "" || sb.Key() == "" {
 		return types.InvalidParameterErrorf("invalid Sandbox passed to endpoint leave: %v", sb)
 	}
@@ -686,10 +821,10 @@ func (ep *Endpoint) Leave(sb *Sandbox) error {
 	sb.joinLeaveStart()
 	defer sb.joinLeaveEnd()
 
-	return ep.sbLeave(sb, false)
+	return ep.sbLeave(ctx, sb, false)
 }
 
-func (ep *Endpoint) sbLeave(sb *Sandbox, force bool) error {
+func (ep *Endpoint) sbLeave(ctx context.Context, sb *Sandbox, force bool) error {
 	n, err := ep.getNetworkFromStore()
 	if err != nil {
 		return fmt.Errorf("failed to get network from store during leave: %v", err)
@@ -699,6 +834,13 @@ func (ep *Endpoint) sbLeave(sb *Sandbox, force bool) error {
 	if err != nil {
 		return fmt.Errorf("failed to get endpoint from store during leave: %v", err)
 	}
+
+	ctx = log.WithLogger(ctx, log.G(ctx).WithFields(log.Fields{
+		"nid": n.ID(),
+		"net": n.Name(),
+		"eid": ep.ID(),
+		"ep":  ep.Name(),
+	}))
 
 	ep.mu.Lock()
 	sid := ep.sandboxID
@@ -721,79 +863,131 @@ func (ep *Endpoint) sbLeave(sb *Sandbox, force bool) error {
 	ep.network = n
 	ep.mu.Unlock()
 
-	// Current endpoint providing external connectivity to the sandbox
-	extEp := sb.getGatewayEndpoint()
-	moveExtConn := extEp != nil && (extEp.ID() == ep.ID())
+	// Current endpoint(s) providing external connectivity to the sandbox
+	gwepBefore4, gwepBefore6 := sb.getGatewayEndpoint()
+	moveExtConn4 := gwepBefore4 != nil && gwepBefore4.ID() == ep.ID()
+	moveExtConn6 := gwepBefore6 != nil && gwepBefore6.ID() == ep.ID()
 
 	if d != nil {
-		if moveExtConn {
-			log.G(context.TODO()).Debugf("Revoking external connectivity on endpoint %s (%s)", ep.Name(), ep.ID())
+		if moveExtConn4 || moveExtConn6 {
+			log.G(ctx).Debug("Revoking external connectivity on endpoint")
 			if err := d.RevokeExternalConnectivity(n.id, ep.id); err != nil {
-				log.G(context.TODO()).Warnf("driver failed revoking external connectivity on endpoint %s (%s): %v",
-					ep.Name(), ep.ID(), err)
+				log.G(ctx).WithError(err).Warn("driver failed revoking external connectivity on endpoint")
 			}
 		}
 
 		if err := d.Leave(n.id, ep.id); err != nil {
 			if _, ok := err.(types.MaskableError); !ok {
-				log.G(context.TODO()).Warnf("driver error disconnecting container %s : %v", ep.name, err)
+				log.G(ctx).WithError(err).Warn("driver error disconnecting container")
 			}
 		}
 	}
 
 	if err := ep.deleteServiceInfoFromCluster(sb, true, "sbLeave"); err != nil {
-		log.G(context.TODO()).Warnf("Failed to clean up service info on container %s disconnect: %v", ep.name, err)
+		log.G(ctx).WithError(err).Warn("Failed to clean up service info on container disconnect")
 	}
 
+	if err := deleteEpFromResolver(ep.Name(), ep.iface, n.Resolvers()); err != nil {
+		log.G(ctx).WithError(err).Warn("Failed to clean up resolver info on container disconnect")
+	}
+
+	// Capture the addresses that were added to the container's /etc/hosts here,
+	// before the endpoint is deleted, so that they can be removed from /etc/hosts.
+	etcHostsAddrs := ep.getEtcHostsAddrs()
+
 	if err := sb.clearNetworkResources(ep); err != nil {
-		log.G(context.TODO()).Warnf("Failed to clean up network resources on container %s disconnect: %v", ep.name, err)
+		log.G(ctx).WithError(err).Warn("Failed to clean up network resources on container disconnect")
 	}
 
 	// Update the store about the sandbox detach only after we
-	// have completed sb.clearNetworkresources above to avoid
+	// have completed sb.clearNetworkResources above to avoid
 	// spurious logs when cleaning up the sandbox when the daemon
 	// ungracefully exits and restarts before completing sandbox
 	// detach but after store has been updated.
-	if err := n.getController().updateToStore(ep); err != nil {
+	if err := n.getController().updateToStore(ctx, ep); err != nil {
 		return err
 	}
 
 	if e := ep.deleteDriverInfoFromCluster(); e != nil {
-		log.G(context.TODO()).Errorf("Failed to delete endpoint state for endpoint %s from cluster: %v", ep.Name(), e)
+		log.G(ctx).WithError(e).Error("Failed to delete endpoint state for endpoint from cluster")
 	}
 
-	sb.deleteHostsEntries(n.getSvcRecords(ep))
+	// When a container is connected to a network, it gets /etc/hosts
+	// entries for its addresses on that network. So, when it's connected
+	// to two networks, it has a hosts entry for each. For example, if
+	// the hostname is the default short-id, and it's connected to two
+	// networks (172.19.0.0/16 and 172.20.0.0/17, plus IPv6 address for
+	// each), the hosts file might include:
+	//
+	//   172.19.0.2	4b92a573912d
+	//   fd8c:c894:d68::2	4b92a573912d
+	//   172.20.0.2	4b92a573912d
+	//   fd8c:c894:d68:1::2	4b92a573912d
+	//
+	// If the container is disconnected from 172.19.0.2, only remove
+	// the hosts entries with addresses on that network.
+	sb.deleteHostsEntries(etcHostsAddrs)
+
 	if !sb.inDelete && sb.needDefaultGW() && sb.getEndpointInGWNetwork() == nil {
 		return sb.setupDefaultGW()
 	}
 
-	// New endpoint providing external connectivity for the sandbox
-	extEp = sb.getGatewayEndpoint()
 	// Disable upstream forwarding if the sandbox lost external connectivity.
 	if sb.resolver != nil {
-		sb.resolver.SetForwardingPolicy(extEp != nil)
+		sb.resolver.SetForwardingPolicy(sb.hasExternalAccess())
 	}
 
-	if moveExtConn && extEp != nil {
-		log.G(context.TODO()).Debugf("Programming external connectivity on endpoint %s (%s)", extEp.Name(), extEp.ID())
-		extN, err := extEp.getNetworkFromStore()
-		if err != nil {
-			return fmt.Errorf("failed to get network from store for programming external connectivity during leave: %v", err)
+	// New endpoint(s) providing external connectivity for the sandbox
+	if moveExtConn4 || moveExtConn6 {
+		gwepAfter4, gwepAfter6 := sb.getGatewayEndpoint()
+		if gwepAfter4 != nil {
+			// If the IPv4 gateway hasn't changed, and there was no IPv6 gateway before but
+			// there is now, the driver for the IPv4 gateway must not proxy host-IPv6 to
+			// container-IPv4 (6To4). Conversely, if there was an IPv6 gateway before but
+			// there isn't one now, the driver must now be told it can proxy 6To4.
+			//
+			// Note that revoking/restoring external connectivity will result in the bridge
+			// driver assigning new host ports for port mappings where the host port is not
+			// specified.
+			restartGw4 := gwepBefore4 == gwepAfter4 && ((gwepBefore6 == nil) != (gwepAfter6 == nil))
+			noProxy6To4 := gwepAfter6 != nil && gwepAfter6 != gwepAfter4
+			labels := sb.Labels()
+			labels[netlabel.NoProxy6To4] = noProxy6To4
+			if restartGw4 {
+				log.G(ctx).WithFields(log.Fields{"noProxy6To4": noProxy6To4}).Debug("Resetting IPv4 endpoint")
+				if undoFunc, err := gwepBefore4.revokeExternalConnectivity(); err != nil {
+					log.G(ctx).WithError(err).Error("Failed to restart IPv4 gateway")
+				} else if err := undoFunc(ctx, labels); err != nil {
+					log.G(ctx).WithError(err).Error("Failed to restore IPv4 gateway")
+				}
+			} else if moveExtConn4 {
+				log.G(ctx).Debugf("Programming IPv6 gateway endpoint %s (%s)", ep.Name(), ep.ID())
+				if err := gwepAfter4.programExternalConnectivity(ctx, labels); err != nil {
+					role := "IPv4"
+					if gwepAfter6 == gwepAfter4 {
+						role = "dual-stack"
+					}
+					log.G(ctx).WithFields(log.Fields{
+						"role":  role,
+						"error": err,
+					}).Error("Failed to set gateway")
+				}
+			}
 		}
-		extD, err := extN.driver(true)
-		if err != nil {
-			return fmt.Errorf("failed to get driver for programming external connectivity during leave: %v", err)
-		}
-		if err := extD.ProgramExternalConnectivity(extEp.network.ID(), extEp.ID(), sb.Labels()); err != nil {
-			log.G(context.TODO()).Warnf("driver failed programming external connectivity on endpoint %s: (%s) %v",
-				extEp.Name(), extEp.ID(), err)
+		if gwepAfter6 != nil && moveExtConn6 && gwepAfter6 != gwepAfter4 {
+			if err := gwepAfter6.programExternalConnectivity(ctx, sb.Labels()); err != nil {
+				log.G(ctx).WithError(err).Error("Failed to set IPv6 gateway")
+			}
 		}
 	}
 
 	if !sb.needDefaultGW() {
 		if err := sb.clearDefaultGW(); err != nil {
-			log.G(context.TODO()).Warnf("Failure while disconnecting sandbox %s (%s) from gateway network: %v",
-				sb.ID(), sb.ContainerID(), err)
+			log.G(ctx).WithFields(log.Fields{
+				"error": err,
+				"sid":   sb.ID(),
+				"cid":   sb.ContainerID(),
+			}).Warn("Failure while disconnecting sandbox from gateway network")
 		}
 	}
 
@@ -801,7 +995,7 @@ func (ep *Endpoint) sbLeave(sb *Sandbox, force bool) error {
 }
 
 // Delete deletes and detaches this endpoint from the network.
-func (ep *Endpoint) Delete(force bool) error {
+func (ep *Endpoint) Delete(ctx context.Context, force bool) error {
 	var err error
 	n, err := ep.getNetworkFromStore()
 	if err != nil {
@@ -825,8 +1019,8 @@ func (ep *Endpoint) Delete(force bool) error {
 	}
 
 	if sb != nil {
-		if e := ep.sbLeave(sb, force); e != nil {
-			log.G(context.TODO()).Warnf("failed to leave sandbox for endpoint %s : %v", name, e)
+		if e := ep.sbLeave(context.WithoutCancel(ctx), sb, force); e != nil {
+			log.G(ctx).Warnf("failed to leave sandbox for endpoint %s : %v", name, e)
 		}
 	}
 
@@ -837,14 +1031,14 @@ func (ep *Endpoint) Delete(force bool) error {
 	defer func() {
 		if err != nil && !force {
 			ep.dbExists = false
-			if e := n.getController().updateToStore(ep); e != nil {
-				log.G(context.TODO()).Warnf("failed to recreate endpoint in store %s : %v", name, e)
+			if e := n.getController().updateToStore(context.WithoutCancel(ctx), ep); e != nil {
+				log.G(ctx).Warnf("failed to recreate endpoint in store %s : %v", name, e)
 			}
 		}
 	}()
 
 	if !n.getController().isSwarmNode() || n.Scope() != scope.Swarm || !n.driverIsMultihost() {
-		n.updateSvcRecord(ep, false)
+		n.updateSvcRecord(context.WithoutCancel(ctx), ep, false)
 	}
 
 	if err = ep.deleteEndpoint(force); err != nil && !force {
@@ -854,7 +1048,7 @@ func (ep *Endpoint) Delete(force bool) error {
 	ep.releaseAddress()
 
 	if err := n.getEpCnt().DecEndpointCnt(); err != nil {
-		log.G(context.TODO()).Warnf("failed to decrement endpoint count for ep %s: %v", ep.ID(), err)
+		log.G(ctx).Warnf("failed to decrement endpoint count for ep %s: %v", ep.ID(), err)
 	}
 
 	return nil
@@ -903,7 +1097,7 @@ func (ep *Endpoint) getSandbox() (*Sandbox, bool) {
 }
 
 // Return a list of this endpoint's addresses to add to '/etc/hosts'.
-func (ep *Endpoint) getEtcHostsAddrs() []string {
+func (ep *Endpoint) getEtcHostsAddrs() []netip.Addr {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
 
@@ -912,12 +1106,16 @@ func (ep *Endpoint) getEtcHostsAddrs() []string {
 		return nil
 	}
 
-	var addresses []string
+	var addresses []netip.Addr
 	if ep.iface.addr != nil {
-		addresses = append(addresses, ep.iface.addr.IP.String())
+		if addr, ok := netip.AddrFromSlice(ep.iface.addr.IP); ok {
+			addresses = append(addresses, addr)
+		}
 	}
 	if ep.iface.addrv6 != nil {
-		addresses = append(addresses, ep.iface.addrv6.IP.String())
+		if addr, ok := netip.AddrFromSlice(ep.iface.addrv6.IP); ok {
+			addresses = append(addresses, addr)
+		}
 	}
 	return addresses
 }
@@ -1003,6 +1201,14 @@ func CreateOptionDisableResolution() EndpointOption {
 	}
 }
 
+// CreateOptionDisableIPv6 prevents allocation of an IPv6 address/gateway, even
+// if the container is connected to an IPv6-enabled network.
+func CreateOptionDisableIPv6() EndpointOption {
+	return func(ep *Endpoint) {
+		ep.disableIPv6 = true
+	}
+}
+
 // CreateOptionAlias function returns an option setter for setting endpoint alias
 func CreateOptionAlias(name string, alias string) EndpointOption {
 	return func(ep *Endpoint) {
@@ -1048,9 +1254,13 @@ func JoinOptionPriority(prio int) EndpointOption {
 	}
 }
 
-func (ep *Endpoint) assignAddress(ipam ipamapi.Ipam, assignIPv4, assignIPv6 bool) error {
-	var err error
+func WithNetnsPath(path string) EndpointOption {
+	return func(ep *Endpoint) {
+		ep.iface.netnsPath = path
+	}
+}
 
+func (ep *Endpoint) assignAddress(ipam ipamapi.Ipam, assignIPv4, assignIPv6 bool) error {
 	n := ep.getNetwork()
 	if n.hasSpecialDriver() {
 		return nil
@@ -1059,16 +1269,18 @@ func (ep *Endpoint) assignAddress(ipam ipamapi.Ipam, assignIPv4, assignIPv6 bool
 	log.G(context.TODO()).Debugf("Assigning addresses for endpoint %s's interface on network %s", ep.Name(), n.Name())
 
 	if assignIPv4 {
-		if err = ep.assignAddressVersion(4, ipam); err != nil {
+		if err := ep.assignAddressVersion(4, ipam); err != nil {
 			return err
 		}
 	}
 
 	if assignIPv6 {
-		err = ep.assignAddressVersion(6, ipam)
+		if err := ep.assignAddressVersion(6, ipam); err != nil {
+			return err
+		}
 	}
 
-	return err
+	return nil
 }
 
 func (ep *Endpoint) assignAddressVersion(ipVer int, ipam ipamapi.Ipam) error {
@@ -1094,10 +1306,8 @@ func (ep *Endpoint) assignAddressVersion(ipVer int, ipam ipamapi.Ipam) error {
 	}
 
 	ipInfo := n.getIPInfo(ipVer)
-
-	// ipv6 address is not mandatory
-	if len(ipInfo) == 0 && ipVer == 6 {
-		return nil
+	if len(ipInfo) == 0 {
+		return fmt.Errorf("no IPv%d information available for endpoint %s", ipVer, ep.Name())
 	}
 
 	// The address to program may be chosen by the user or by the network driver in one specific
@@ -1185,7 +1395,7 @@ func (c *Controller) cleanupLocalEndpoints() error {
 				continue
 			}
 			log.G(context.TODO()).Infof("Removing stale endpoint %s (%s)", ep.name, ep.id)
-			if err := ep.Delete(true); err != nil {
+			if err := ep.Delete(context.WithoutCancel(context.TODO()), true); err != nil {
 				log.G(context.TODO()).Warnf("Could not delete local endpoint %s during endpoint cleanup: %v", ep.name, err)
 			}
 		}

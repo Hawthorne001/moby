@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/containerd/log"
 	"github.com/docker/docker/api/server/httputils"
@@ -25,7 +26,6 @@ import (
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
-	units "github.com/docker/go-units"
 	"github.com/pkg/errors"
 )
 
@@ -105,7 +105,7 @@ func newImageBuildOptions(ctx context.Context, r *http.Request) (*types.ImageBui
 	}
 
 	if ulimitsJSON := r.FormValue("ulimits"); ulimitsJSON != "" {
-		buildUlimits := []*units.Ulimit{}
+		buildUlimits := []*container.Ulimit{}
 		if err := json.Unmarshal([]byte(ulimitsJSON), &buildUlimits); err != nil {
 			return nil, invalidParam{errors.Wrap(err, "error reading ulimit settings")}
 		}
@@ -245,8 +245,9 @@ func (br *buildRouter) postBuild(ctx context.Context, w http.ResponseWriter, r *
 			return err
 		}
 		_, err = output.Write(streamformatter.FormatError(err))
-		if err != nil {
-			log.G(ctx).Warnf("could not write error response: %v", err)
+		// don't log broken pipe errors as this is the normal case when a client aborts.
+		if err != nil && !errors.Is(err, syscall.EPIPE) {
+			log.G(ctx).WithError(err).Warn("could not write error response")
 		}
 		return nil
 	}
@@ -281,6 +282,9 @@ func (br *buildRouter) postBuild(ctx context.Context, w http.ResponseWriter, r *
 		ProgressWriter: buildProgressWriter(out, wantAux, createProgressReader),
 	})
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			log.G(ctx).Debug("build canceled")
+		}
 		return errf(err)
 	}
 
@@ -340,8 +344,12 @@ type flusher interface {
 	Flush()
 }
 
+type nopFlusher struct{}
+
+func (f *nopFlusher) Flush() {}
+
 func wrapOutputBufferedUntilRequestRead(rc io.ReadCloser, out io.Writer) (io.ReadCloser, io.Writer) {
-	var fl flusher = &ioutils.NopFlusher{}
+	var fl flusher = &nopFlusher{}
 	if f, ok := out.(flusher); ok {
 		fl = f
 	}

@@ -15,7 +15,9 @@ import (
 
 	"github.com/cpuguy83/tar2go"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/versions"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/integration/internal/build"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/internal/testutils"
@@ -63,7 +65,7 @@ func TestSaveCheckTimes(t *testing.T) {
 	img, _, err := client.ImageInspectWithRaw(ctx, repoName)
 	assert.NilError(t, err)
 
-	rdr, err := client.ImageSave(ctx, []string{repoName})
+	rdr, err := client.ImageSave(ctx, []string{repoName}, image.SaveOptions{})
 	assert.NilError(t, err)
 
 	tarfs := tarIndexFS(t, rdr)
@@ -108,10 +110,10 @@ func TestSaveOCI(t *testing.T) {
 
 	testCases := []testCase{
 		// Busybox by tagged name
-		testCase{image: busybox, expectedContainerdRef: "docker.io/library/busybox:latest", expectedOCIRef: "latest"},
+		{image: busybox, expectedContainerdRef: "docker.io/library/busybox:latest", expectedOCIRef: "latest"},
 
 		// Busybox by ID
-		testCase{image: inspectBusybox.ID},
+		{image: inspectBusybox.ID},
 	}
 
 	if testEnv.DaemonInfo.OSType != "windows" {
@@ -132,13 +134,12 @@ func TestSaveOCI(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.image, func(t *testing.T) {
 			// Get information about the original image.
 			inspect, _, err := client.ImageInspectWithRaw(ctx, tc.image)
 			assert.NilError(t, err)
 
-			rdr, err := client.ImageSave(ctx, []string{tc.image})
+			rdr, err := client.ImageSave(ctx, []string{tc.image}, image.SaveOptions{})
 			assert.NilError(t, err)
 			defer rdr.Close()
 
@@ -208,9 +209,29 @@ func TestSaveOCI(t *testing.T) {
 			t.Run("OCI reference tag", func(t *testing.T) {
 				assert.Check(t, is.Equal(index.Manifests[0].Annotations["org.opencontainers.image.ref.name"], tc.expectedOCIRef))
 			})
-
 		})
 	}
+}
+
+// TODO(thaJeztah): this test currently only checks invalid cases; update this test to use a table-test and test both valid and invalid platform options.
+func TestSavePlatform(t *testing.T) {
+	ctx := setupTest(t)
+
+	t.Parallel()
+	client := testEnv.APIClient()
+
+	const repoName = "busybox:latest"
+	_, _, err := client.ImageInspectWithRaw(ctx, repoName)
+	assert.NilError(t, err)
+
+	_, err = client.ImageSave(ctx, []string{repoName}, image.SaveOptions{
+		Platforms: []ocispec.Platform{
+			{Architecture: "amd64", OS: "linux"},
+			{Architecture: "arm64", OS: "linux", Variant: "v8"},
+		},
+	})
+	assert.Check(t, is.ErrorType(err, errdefs.IsInvalidParameter))
+	assert.Check(t, is.Error(err, "Error response from daemon: multiple platform parameters not supported"))
 }
 
 func TestSaveRepoWithMultipleImages(t *testing.T) {
@@ -243,7 +264,7 @@ func TestSaveRepoWithMultipleImages(t *testing.T) {
 	idBar := makeImage("busybox:latest", tagBar)
 	idBusybox := busyboxImg.ID
 
-	rdr, err := client.ImageSave(ctx, []string{repoName, "busybox:latest"})
+	rdr, err := client.ImageSave(ctx, []string{repoName, "busybox:latest"}, image.SaveOptions{})
 	assert.NilError(t, err)
 	defer rdr.Close()
 
@@ -300,7 +321,7 @@ RUN touch /opt/a/b/c && chown user:user /opt/a/b/c`
 
 	imgID := build.Do(ctx, t, client, fakecontext.New(t, t.TempDir(), fakecontext.WithDockerfile(dockerfile)))
 
-	rdr, err := client.ImageSave(ctx, []string{imgID})
+	rdr, err := client.ImageSave(ctx, []string{imgID}, image.SaveOptions{})
 	assert.NilError(t, err)
 	defer rdr.Close()
 

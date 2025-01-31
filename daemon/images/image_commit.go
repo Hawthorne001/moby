@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/docker/docker/api/types/backend"
+	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/ioutils"
@@ -62,6 +63,9 @@ func (i *ImageService) CommitImage(ctx context.Context, c backend.CommitConfig) 
 	if err != nil {
 		return "", err
 	}
+
+	i.LogImageEvent(ctx, id.String(), id.String(), events.ActionCreate)
+
 	if err := i.imageStore.SetBuiltLocally(id); err != nil {
 		return "", err
 	}
@@ -124,7 +128,7 @@ func (i *ImageService) CommitBuildStep(ctx context.Context, c backend.CommitConf
 		return "", errors.Errorf("container not found: %s", c.ContainerID)
 	}
 	c.ContainerMountLabel = ctr.MountLabel
-	c.ContainerOS = ctr.OS
+	c.ContainerOS = ctr.ImagePlatform.OS
 	c.ParentImageID = string(ctr.ImageID)
 	return i.CommitImage(ctx, c)
 }

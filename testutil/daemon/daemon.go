@@ -4,18 +4,22 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/container"
@@ -86,6 +90,8 @@ type Daemon struct {
 	usernsRemap                string
 	rootlessUser               *user.User
 	rootlessXDGRuntimeDir      string
+	resolvConfContent          string
+	ResolvConfPathOverride     string // Path to a replacement for "/etc/resolv.conf", or empty.
 
 	// swarm related field
 	swarmListenAddr string
@@ -142,6 +148,15 @@ func NewDaemon(workingDir string, ops ...Option) (*Daemon, error) {
 
 	for _, op := range ops {
 		op(d)
+	}
+
+	if len(d.resolvConfContent) > 0 {
+		path := filepath.Join(d.Folder, "resolv.conf")
+		if err := os.WriteFile(path, []byte(d.resolvConfContent), 0644); err != nil {
+			return nil, fmt.Errorf("failed to write docker resolv.conf to %q: %v", path, err)
+		}
+		d.extraEnv = append(d.extraEnv, "DOCKER_TEST_RESOLV_CONF_PATH="+path)
+		d.ResolvConfPathOverride = path
 	}
 
 	if d.rootlessUser != nil {
@@ -621,6 +636,11 @@ func (d *Daemon) Kill() error {
 		return err
 	}
 
+	_, err := d.cmd.Process.Wait()
+	if err != nil && !errors.Is(err, syscall.ECHILD) {
+		return err
+	}
+
 	if d.pidFile != "" {
 		_ = os.Remove(d.pidFile)
 	}
@@ -823,6 +843,17 @@ func (d *Daemon) ReloadConfig() error {
 	return nil
 }
 
+// SetEnvVar updates the set of extra env variables for the daemon, to take
+// effect on the next start/restart.
+func (d *Daemon) SetEnvVar(name, val string) {
+	prefix := name + "="
+	if idx := slices.IndexFunc(d.extraEnv, func(ev string) bool { return strings.HasPrefix(ev, prefix) }); idx > 0 {
+		d.extraEnv[idx] = prefix + val
+		return
+	}
+	d.extraEnv = append(d.extraEnv, prefix+val)
+}
+
 // LoadBusybox image into the daemon
 func (d *Daemon) LoadBusybox(ctx context.Context, t testing.TB) {
 	t.Helper()
@@ -830,14 +861,14 @@ func (d *Daemon) LoadBusybox(ctx context.Context, t testing.TB) {
 	assert.NilError(t, err, "[%s] failed to create client", d.id)
 	defer clientHost.Close()
 
-	reader, err := clientHost.ImageSave(ctx, []string{"busybox:latest"})
+	reader, err := clientHost.ImageSave(ctx, []string{"busybox:latest"}, image.SaveOptions{})
 	assert.NilError(t, err, "[%s] failed to download busybox", d.id)
 	defer reader.Close()
 
 	c := d.NewClientT(t)
 	defer c.Close()
 
-	resp, err := c.ImageLoad(ctx, reader, true)
+	resp, err := c.ImageLoad(ctx, reader, image.LoadOptions{Quiet: true})
 	assert.NilError(t, err, "[%s] failed to load busybox", d.id)
 	defer resp.Body.Close()
 }

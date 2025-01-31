@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/testutil"
 	testdaemon "github.com/docker/docker/testutil/daemon"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
 )
 
@@ -186,7 +187,7 @@ func (s *DockerCLILogsSuite) TestLogsSince(c *testing.T) {
 		result := icmd.RunCommand(dockerBinary, cmd...)
 		result.Assert(c, icmd.Success)
 		for _, v := range expected {
-			assert.Check(c, strings.Contains(result.Combined(), v))
+			assert.Check(c, is.Contains(result.Combined(), v))
 		}
 	}
 }
@@ -292,7 +293,7 @@ func (s *DockerCLILogsSuite) TestLogsFollowGoroutinesWithStdout(c *testing.T) {
 		d.Stop(c)
 		d.Cleanup(c)
 	}()
-	d.StartWithBusybox(ctx, c, "--iptables=false")
+	d.StartWithBusybox(ctx, c, "--iptables=false", "--ip6tables=false")
 
 	out, err := d.Cmd("run", "-d", "busybox", "/bin/sh", "-c", "while true; do echo hello; sleep 2; done")
 	assert.NilError(c, err)
@@ -301,7 +302,7 @@ func (s *DockerCLILogsSuite) TestLogsFollowGoroutinesWithStdout(c *testing.T) {
 	assert.NilError(c, d.WaitRun(id))
 
 	client := d.NewClientT(c)
-	nroutines := waitForStableGourtineCount(ctx, c, client)
+	nroutines := waitForStableGoroutineCount(ctx, c, client)
 
 	cmd := d.Command("logs", "-f", id)
 	r, w := io.Pipe()
@@ -349,7 +350,7 @@ func (s *DockerCLILogsSuite) TestLogsFollowGoroutinesNoOutput(c *testing.T) {
 
 	ctx := testutil.GetContext(c)
 
-	d.StartWithBusybox(ctx, c, "--iptables=false")
+	d.StartWithBusybox(ctx, c, "--iptables=false", "--ip6tables=false")
 
 	out, err := d.Cmd("run", "-d", "busybox", "/bin/sh", "-c", "while true; do sleep 2; done")
 	assert.NilError(c, err)
@@ -357,7 +358,7 @@ func (s *DockerCLILogsSuite) TestLogsFollowGoroutinesNoOutput(c *testing.T) {
 	assert.NilError(c, d.WaitRun(id))
 
 	client := d.NewClientT(c)
-	nroutines := waitForStableGourtineCount(ctx, c, client)
+	nroutines := waitForStableGoroutineCount(ctx, c, client)
 	assert.NilError(c, err)
 
 	cmd := d.Command("logs", "-f", id)
@@ -382,7 +383,7 @@ func (s *DockerCLILogsSuite) TestLogsCLIContainerNotFound(c *testing.T) {
 	name := "testlogsnocontainer"
 	out, _, _ := dockerCmdWithError("logs", name)
 	message := fmt.Sprintf("No such container: %s\n", name)
-	assert.Assert(c, strings.Contains(out, message))
+	assert.Assert(c, is.Contains(out, message))
 }
 
 func (s *DockerCLILogsSuite) TestLogsWithDetails(c *testing.T) {

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/docker/docker/api"
 	"github.com/docker/docker/api/types/versions"
+	dopts "github.com/docker/docker/internal/opts"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/registry"
 	"github.com/pkg/errors"
@@ -64,6 +67,9 @@ const (
 	// SeccompProfileUnconfined is a special profile name for seccomp to use an
 	// "unconfined" seccomp profile.
 	SeccompProfileUnconfined = "unconfined"
+	// LibnetDataPath is the path to libnetwork's data directory, relative to cfg.Root.
+	// Windows tolerates the "/".
+	LibnetDataPath = "network/files"
 )
 
 // flatOptions contains configuration keys
@@ -98,6 +104,24 @@ var skipValidateOptions = map[string]bool{
 // during the parsing.
 var skipDuplicates = map[string]bool{
 	"runtimes": true,
+}
+
+// migratedNamedConfig describes legacy configuration file keys that have been migrated
+// from simple entries equivalent to command line flags, to a named option.
+//
+// For example, "host-gateway-ip" allowed for a single IP address. "host-gateway-ips"
+// allows for an IPv4 and an IPv6 address, and is implemented as a NamedOption for
+// command line flag "--host-gateway-ip".
+//
+// Each legacy name is mapped to its new name and a function that can be called to
+// migrate config from one to the other. The migration function is only called after
+// confirming that the option is only specified in one of the new, old or command
+// line options.
+var migratedNamedConfig = map[string]struct {
+	newName string
+	migrate func(*Config)
+}{
+	"host-gateway-ip": {newName: "host-gateway-ips", migrate: migrateHostGatewayIP},
 }
 
 // LogConfig represents the default log configuration.
@@ -136,10 +160,11 @@ type TLSOptions struct {
 
 // DNSConfig defines the DNS configurations.
 type DNSConfig struct {
-	DNS           []net.IP `json:"dns,omitempty"`
-	DNSOptions    []string `json:"dns-opts,omitempty"`
-	DNSSearch     []string `json:"dns-search,omitempty"`
-	HostGatewayIP net.IP   `json:"host-gateway-ip,omitempty"`
+	DNS            []net.IP     `json:"dns,omitempty"`
+	DNSOptions     []string     `json:"dns-opts,omitempty"`
+	DNSSearch      []string     `json:"dns-search,omitempty"`
+	HostGatewayIP  net.IP       `json:"host-gateway-ip,omitempty"` // Deprecated: this single-IP is migrated to HostGatewayIPs
+	HostGatewayIPs []netip.Addr `json:"host-gateway-ips,omitempty"`
 }
 
 // CommonConfig defines the configuration of a docker daemon which is
@@ -160,7 +185,7 @@ type CommonConfig struct {
 	Root                  string   `json:"data-root,omitempty"`
 	ExecRoot              string   `json:"exec-root,omitempty"`
 	SocketGroup           string   `json:"group,omitempty"`
-	CorsHeaders           string   `json:"api-cors-header,omitempty"`
+	CorsHeaders           string   `json:"api-cors-header,omitempty"` // Deprecated: CORS headers should not be set on the API. This feature will be removed in the next release. // TODO(thaJeztah): option is used to produce error when used; remove in next release
 
 	// Proxies holds the proxies that are configured for the daemon.
 	Proxies `json:"proxies"`
@@ -305,6 +330,7 @@ func New() (*Config, error) {
 			},
 			ContainerdNamespace:       DefaultContainersNamespace,
 			ContainerdPluginNamespace: DefaultPluginNamespace,
+			Features:                  make(map[string]bool),
 			DefaultRuntime:            StockRuntimeName,
 			MinAPIVersion:             defaultMinAPIVersion,
 		},
@@ -315,6 +341,17 @@ func New() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// GetExecOpt looks up a user-configured exec-opt. It returns a boolean
+// if found, and an error if the configuration has invalid options set.
+func (conf *Config) GetExecOpt(name string) (val string, found bool, _ error) {
+	o, err := parseExecOptions(conf.ExecOptions)
+	if err != nil {
+		return "", false, err
+	}
+	val, found = o[name]
+	return val, found, nil
 }
 
 // GetConflictFreeLabels validates Labels for conflict
@@ -514,6 +551,10 @@ func getConflictFreeConfiguration(configFile string, flags *pflag.FlagSet) (*Con
 		return nil, err
 	}
 
+	for _, mc := range migratedNamedConfig {
+		mc.migrate(&config)
+	}
+
 	return &config, nil
 }
 
@@ -564,7 +605,7 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 		return errors.Errorf("the following directives don't match any configuration option: %s", strings.Join(unknown, ", "))
 	}
 
-	var conflicts []string
+	// 3. Search keys that are present as a flag and as a file option.
 	printConflict := func(name string, flagValue, fileValue interface{}) string {
 		switch name {
 		case "http-proxy", "https-proxy":
@@ -574,8 +615,8 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 		return fmt.Sprintf("%s: (from flag: %v, from file: %v)", name, flagValue, fileValue)
 	}
 
-	// 3. Search keys that are present as a flag and as a file option.
-	duplicatedConflicts := func(f *pflag.Flag) {
+	var conflicts []string
+	flags.Visit(func(f *pflag.Flag) {
 		// search option name in the json configuration payload if the value is a named option
 		if namedOption, ok := f.Value.(opts.NamedOption); ok {
 			if optsValue, ok := config[namedOption.Name()]; ok && !skipDuplicates[namedOption.Name()] {
@@ -590,14 +631,30 @@ func findConfigurationConflicts(config map[string]interface{}, flags *pflag.Flag
 				}
 			}
 		}
-	}
+	})
 
-	flags.Visit(duplicatedConflicts)
+	// 4. Search for options that have been migrated to a NamedOption. These must not
+	// be specified using both old and new config file names, or using the original
+	// config file name and on the command line. (Or using the new config file name
+	// and the command line, but those have already been found by the search above.)
+	var errs []error
+	for oldName, migration := range migratedNamedConfig {
+		oldNameVal, haveOld := config[oldName]
+		_, haveNew := config[migration.newName]
+		if haveOld {
+			if haveNew {
+				errs = append(errs, fmt.Errorf("%s and %s must not both be specified in the config file", oldName, migration.newName))
+			}
+			if f := flags.Lookup(oldName); f != nil && f.Changed {
+				conflicts = append(conflicts, printConflict(oldName, f.Value.String(), oldNameVal))
+			}
+		}
+	}
 
 	if len(conflicts) > 0 {
-		return errors.Errorf("the following directives are specified both as a flag and in the configuration file: %s", strings.Join(conflicts, ", "))
+		errs = append(errs, errors.Errorf("the following directives are specified both as a flag and in the configuration file: %s", strings.Join(conflicts, ", ")))
 	}
-	return nil
+	return stderrors.Join(errs...)
 }
 
 // ValidateMinAPIVersion verifies if the given API version is within the
@@ -652,6 +709,11 @@ func Validate(config *Config) error {
 		}
 	}
 
+	// validate HostGatewayIPs
+	if err := dopts.ValidateHostGatewayIPs(config.HostGatewayIPs); err != nil {
+		return err
+	}
+
 	// validate Labels
 	for _, label := range config.Labels {
 		if _, err := opts.ValidateLabel(label); err != nil {
@@ -672,6 +734,9 @@ func Validate(config *Config) error {
 	if config.MaxDownloadAttempts < 0 {
 		return errors.Errorf("invalid max download attempts: %d", config.MaxDownloadAttempts)
 	}
+	if config.NetworkDiagnosticPort < 0 || config.NetworkDiagnosticPort > 65535 {
+		return errors.Errorf("invalid network-diagnostic-port (%d): value must be between 0 and 65535", config.NetworkDiagnosticPort)
+	}
 
 	if _, err := ParseGenericResources(config.NodeGenericResources); err != nil {
 		return err
@@ -683,8 +748,39 @@ func Validate(config *Config) error {
 		}
 	}
 
+	if config.CorsHeaders != "" {
+		// TODO(thaJeztah): option is used to produce error when used; remove in next release
+		return errors.New(`DEPRECATED: The "api-cors-header" config parameter and the dockerd "--api-cors-header" option have been removed; use a reverse proxy if you need CORS headers`)
+	}
+
+	if _, err := parseExecOptions(config.ExecOptions); err != nil {
+		return err
+	}
+
 	// validate platform-specific settings
-	return config.ValidatePlatformConfig()
+	return validatePlatformConfig(config)
+}
+
+// parseExecOptions parses the given exec-options into a map. It returns an
+// error if the exec-options are formatted incorrectly, or when options are
+// used that are not supported on this platform.
+//
+// TODO(thaJeztah): consider making this more strict: make options case-sensitive and disallow whitespace around "=".
+func parseExecOptions(execOptions []string) (map[string]string, error) {
+	o := make(map[string]string)
+	for _, keyValue := range execOptions {
+		k, v, ok := strings.Cut(keyValue, "=")
+		k = strings.ToLower(strings.TrimSpace(k))
+		v = strings.TrimSpace(v)
+		if !ok || k == "" || v == "" {
+			return nil, fmt.Errorf("invalid exec-opt (%s): must be formatted 'opt=value'", keyValue)
+		}
+		if err := validatePlatformExecOpt(k, v); err != nil {
+			return nil, fmt.Errorf("invalid exec-opt (%s): %w", keyValue, err)
+		}
+		o[k] = v
+	}
+	return o, nil
 }
 
 // MaskCredentials masks credentials that are in an URL.
@@ -695,4 +791,13 @@ func MaskCredentials(rawURL string) string {
 	}
 	parsedURL.User = url.UserPassword("xxxxx", "xxxxx")
 	return parsedURL.String()
+}
+
+func migrateHostGatewayIP(config *Config) {
+	hgip := config.HostGatewayIP //nolint:staticcheck // ignore SA1019: migrating to HostGatewayIPs.
+	if hgip != nil {
+		addr, _ := netip.AddrFromSlice(hgip)
+		config.HostGatewayIPs = []netip.Addr{addr}
+		config.HostGatewayIP = nil //nolint:staticcheck // ignore SA1019: clearing old value.
+	}
 }

@@ -4,14 +4,14 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/diff"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/reference"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/pkg/reference"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/client/llb/sourceresolver"
@@ -25,6 +25,7 @@ import (
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/util/pull"
 	"github.com/moby/buildkit/util/resolver"
+	"github.com/moby/buildkit/util/tracing"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -148,7 +149,12 @@ func (is *Source) Resolve(ctx context.Context, id source.Identifier, sm *session
 	return p, nil
 }
 
-func (is *Source) ResolveImageConfig(ctx context.Context, ref string, opt sourceresolver.Opt, sm *session.Manager, g session.Group) (digest.Digest, []byte, error) {
+func (is *Source) ResolveImageConfig(ctx context.Context, ref string, opt sourceresolver.Opt, sm *session.Manager, g session.Group) (digest digest.Digest, config []byte, retErr error) {
+	span, ctx := tracing.StartSpan(ctx, "resolving "+ref)
+	defer func() {
+		tracing.FinishWithError(span, retErr)
+	}()
+
 	key := ref
 	var (
 		rm    resolver.ResolveMode
@@ -156,7 +162,7 @@ func (is *Source) ResolveImageConfig(ctx context.Context, ref string, opt source
 		err   error
 	)
 	if platform := opt.Platform; platform != nil {
-		key += platforms.Format(*platform)
+		key += platforms.FormatAll(*platform)
 	}
 
 	switch is.ResolverType {

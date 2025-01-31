@@ -3,7 +3,7 @@ package containerd
 import (
 	"context"
 
-	containerdimages "github.com/containerd/containerd/images"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/opencontainers/go-digest"
@@ -13,7 +13,6 @@ import (
 // getImagesWithLabel returns all images that have the matching label key and value.
 func (i *ImageService) getImagesWithLabel(ctx context.Context, labelKey string, labelValue string) ([]image.ID, error) {
 	imgs, err := i.images.List(ctx, "labels."+labelKey+"=="+labelValue)
-
 	if err != nil {
 		return []image.ID{}, errdefs.System(errors.Wrap(err, "failed to list all images"))
 	}
@@ -34,13 +33,13 @@ func (i *ImageService) Children(ctx context.Context, id image.ID) ([]image.ID, e
 // parents returns a slice of image IDs that are parents of the `id` image
 //
 // Called from image_delete.go to prune dangling parents.
-func (i *ImageService) parents(ctx context.Context, id image.ID) ([]containerdimages.Image, error) {
+func (i *ImageService) parents(ctx context.Context, id image.ID) ([]c8dimages.Image, error) {
 	targetImage, err := i.resolveImage(ctx, id.String())
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get child image")
 	}
 
-	var imgs []containerdimages.Image
+	var imgs []c8dimages.Image
 	for {
 		parent, ok := targetImage.Labels[imageLabelClassicBuilderParent]
 		if !ok || parent == "" {

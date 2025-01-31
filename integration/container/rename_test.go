@@ -2,9 +2,7 @@ package container // import "github.com/docker/docker/integration/container"
 
 import (
 	"testing"
-	"time"
 
-	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/integration/internal/container"
@@ -116,7 +114,7 @@ func TestRenameAnonymousContainer(t *testing.T) {
 	apiClient := testEnv.APIClient()
 
 	networkName := "network1" + t.Name()
-	_, err := apiClient.NetworkCreate(ctx, networkName, types.NetworkCreate{})
+	_, err := apiClient.NetworkCreate(ctx, networkName, network.CreateOptions{})
 
 	assert.NilError(t, err)
 	cID := container.Run(ctx, t, apiClient, func(c *container.TestContainerConfig) {
@@ -146,7 +144,7 @@ func TestRenameAnonymousContainer(t *testing.T) {
 		}
 		c.HostConfig.NetworkMode = containertypes.NetworkMode(networkName)
 	}, container.WithCmd("ping", count, "1", container1Name))
-	poll.WaitOn(t, container.IsInState(ctx, apiClient, cID, "exited"), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsInState(ctx, apiClient, cID, "exited"))
 
 	inspect, err := apiClient.ContainerInspect(ctx, cID)
 	assert.NilError(t, err)

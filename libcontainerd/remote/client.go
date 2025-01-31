@@ -13,16 +13,16 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd"
 	apievents "github.com/containerd/containerd/api/events"
 	"github.com/containerd/containerd/api/types"
-	"github.com/containerd/containerd/archive"
-	"github.com/containerd/containerd/cio"
-	"github.com/containerd/containerd/content"
-	cerrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/protobuf"
-	v2runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
+	runcoptions "github.com/containerd/containerd/api/types/runc/options"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/archive"
+	"github.com/containerd/containerd/v2/pkg/cio"
+	"github.com/containerd/containerd/v2/pkg/protobuf"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/typeurl/v2"
 	"github.com/docker/docker/errdefs"
@@ -32,8 +32,9 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -56,7 +57,7 @@ type container struct {
 	client *client
 	c8dCtr containerd.Container
 
-	v2runcoptions *v2runcoptions.Options
+	v2runcoptions *runcoptions.Options
 }
 
 type task struct {
@@ -139,7 +140,7 @@ func (c *client) NewContainer(ctx context.Context, id string, ociSpec *specs.Spe
 		client: c,
 		c8dCtr: ctr,
 	}
-	if x, ok := runtimeOptions.(*v2runcoptions.Options); ok {
+	if x, ok := runtimeOptions.(*runcoptions.Options); ok {
 		created.v2runcoptions = x
 	}
 	return &created, nil
@@ -154,11 +155,14 @@ func (c *container) NewTask(ctx context.Context, checkpointDir string, withStdin
 		stdinCloseSync = make(chan containerd.Process, 1)
 	)
 
+	ctx, span := otel.Tracer("").Start(ctx, "libcontainerd.remote.NewTask")
+	defer span.End()
+
 	if checkpointDir != "" {
 		// write checkpoint to the content store
 		tar := archive.Diff(ctx, "", checkpointDir)
 		var err error
-		checkpoint, err = c.client.writeContent(ctx, images.MediaTypeContainerd1Checkpoint, checkpointDir, tar)
+		checkpoint, err = c.client.writeContent(ctx, c8dimages.MediaTypeContainerd1Checkpoint, checkpointDir, tar)
 		// remove the checkpoint when we're done
 		defer func() {
 			if checkpoint != nil {
@@ -204,7 +208,7 @@ func (c *container) NewTask(ctx context.Context, checkpointDir string, withStdin
 	if runtime.GOOS != "windows" {
 		taskOpts = append(taskOpts, func(_ context.Context, _ *containerd.Client, info *containerd.TaskInfo) error {
 			if c.v2runcoptions != nil {
-				opts := proto.Clone(c.v2runcoptions).(*v2runcoptions.Options)
+				opts := proto.Clone(c.v2runcoptions).(*runcoptions.Options)
 				opts.IoUid = uint32(uid)
 				opts.IoGid = uint32(gid)
 				info.Options = opts
@@ -240,8 +244,9 @@ func (c *container) NewTask(ctx context.Context, checkpointDir string, withStdin
 }
 
 func (t *task) Start(ctx context.Context) error {
+	ctx, span := otel.Tracer("").Start(ctx, "libcontainerd.remote.task.Start")
+	defer span.End()
 	return wrapError(t.Task.Start(ctx))
-
 }
 
 // Exec creates exec process.
@@ -406,11 +411,11 @@ func (p process) Status(ctx context.Context) (containerd.Status, error) {
 func (c *container) getCheckpointOptions(exit bool) containerd.CheckpointTaskOpts {
 	return func(r *containerd.CheckpointTaskInfo) error {
 		if r.Options == nil && c.v2runcoptions != nil {
-			r.Options = &v2runcoptions.CheckpointOptions{}
+			r.Options = &runcoptions.CheckpointOptions{}
 		}
 
 		switch opts := r.Options.(type) {
-		case *v2runcoptions.CheckpointOptions:
+		case *runcoptions.CheckpointOptions:
 			opts.Exit = exit
 		}
 
@@ -443,8 +448,7 @@ func (t *task) CreateCheckpoint(ctx context.Context, checkpointDir string, exit 
 
 	var cpDesc *ocispec.Descriptor
 	for _, m := range index.Manifests {
-		m := m
-		if m.MediaType == images.MediaTypeContainerd1Checkpoint {
+		if m.MediaType == c8dimages.MediaTypeContainerd1Checkpoint {
 			cpDesc = &m //nolint:gosec
 			break
 		}

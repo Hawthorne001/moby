@@ -37,15 +37,17 @@ type EndpointInfo interface {
 
 // EndpointInterface holds interface addresses bound to the endpoint.
 type EndpointInterface struct {
-	mac       net.HardwareAddr
-	addr      *net.IPNet
-	addrv6    *net.IPNet
-	llAddrs   []*net.IPNet
-	srcName   string
-	dstPrefix string
-	routes    []*net.IPNet
-	v4PoolID  string
-	v6PoolID  string
+	mac                net.HardwareAddr
+	addr               *net.IPNet
+	addrv6             *net.IPNet
+	llAddrs            []*net.IPNet
+	srcName            string
+	dstPrefix          string
+	routes             []*net.IPNet
+	v4PoolID           string
+	v6PoolID           string
+	netnsPath          string
+	createdInContainer bool
 }
 
 func (epi *EndpointInterface) MarshalJSON() ([]byte, error) {
@@ -75,6 +77,7 @@ func (epi *EndpointInterface) MarshalJSON() ([]byte, error) {
 	epMap["routes"] = routes
 	epMap["v4PoolID"] = epi.v4PoolID
 	epMap["v6PoolID"] = epi.v6PoolID
+	epMap["createdInContainer"] = epi.createdInContainer
 	return json.Marshal(epMap)
 }
 
@@ -132,6 +135,9 @@ func (epi *EndpointInterface) UnmarshalJSON(b []byte) error {
 	epi.v4PoolID = epMap["v4PoolID"].(string)
 	epi.v6PoolID = epMap["v6PoolID"].(string)
 
+	if v, ok := epMap["createdInContainer"]; ok {
+		epi.createdInContainer = v.(bool)
+	}
 	return nil
 }
 
@@ -143,6 +149,7 @@ func (epi *EndpointInterface) CopyTo(dstEpi *EndpointInterface) error {
 	dstEpi.dstPrefix = epi.dstPrefix
 	dstEpi.v4PoolID = epi.v4PoolID
 	dstEpi.v6PoolID = epi.v6PoolID
+	dstEpi.createdInContainer = epi.createdInContainer
 	if len(epi.llAddrs) != 0 {
 		dstEpi.llAddrs = make([]*net.IPNet, 0, len(epi.llAddrs))
 		dstEpi.llAddrs = append(dstEpi.llAddrs, epi.llAddrs...)
@@ -269,6 +276,18 @@ func (epi *EndpointInterface) SetNames(srcName string, dstPrefix string) error {
 	return nil
 }
 
+// NetnsPath returns the path of the network namespace, if there is one. Else "".
+func (epi *EndpointInterface) NetnsPath() string {
+	return epi.netnsPath
+}
+
+// SetCreatedInContainer can be called by the driver to indicate that it's
+// created the network interface in the container's network namespace (so,
+// it doesn't need to be moved there).
+func (epi *EndpointInterface) SetCreatedInContainer(cic bool) {
+	epi.createdInContainer = cic
+}
+
 func (ep *Endpoint) InterfaceName() driverapi.InterfaceNameInfo {
 	ep.mu.Lock()
 	defer ep.mu.Unlock()
@@ -382,6 +401,40 @@ func (ep *Endpoint) SetGatewayIPv6(gw6 net.IP) error {
 	return nil
 }
 
+// hasGatewayOrDefaultRoute returns true if ep has a gateway, or a route to '0.0.0.0'/'::'.
+func (ep *Endpoint) hasGatewayOrDefaultRoute() (v4, v6 bool) {
+	ep.mu.Lock()
+	defer ep.mu.Unlock()
+
+	if ep.joinInfo != nil {
+		v4 = len(ep.joinInfo.gw) > 0
+		v6 = len(ep.joinInfo.gw6) > 0
+		if !v4 || !v6 {
+			for _, route := range ep.joinInfo.StaticRoutes {
+				if route.Destination.IP.IsUnspecified() && net.IP(route.Destination.Mask).IsUnspecified() {
+					if route.Destination.IP.To4() == nil {
+						v6 = true
+					} else {
+						v4 = true
+					}
+				}
+			}
+		}
+	}
+	if ep.iface != nil && (!v4 || !v6) {
+		for _, route := range ep.iface.routes {
+			if route.IP.IsUnspecified() && net.IP(route.Mask).IsUnspecified() {
+				if route.IP.To4() == nil {
+					v6 = true
+				} else {
+					v4 = true
+				}
+			}
+		}
+	}
+	return v4, v6
+}
+
 func (ep *Endpoint) retrieveFromStore() (*Endpoint, error) {
 	n, err := ep.getNetworkFromStore()
 	if err != nil {
@@ -430,7 +483,6 @@ func (epj *endpointJoinInfo) UnmarshalJSON(b []byte) error {
 	var tStaticRoute []types.StaticRoute
 	if v, ok := epMap["StaticRoutes"]; ok {
 		tb, _ := json.Marshal(v)
-		var tStaticRoute []types.StaticRoute
 		// TODO(cpuguy83): Linter caught that we aren't checking errors here
 		// I don't know why we aren't other than potentially the data is not always expected to be right?
 		// This is why I'm not adding the error check.
@@ -440,7 +492,6 @@ func (epj *endpointJoinInfo) UnmarshalJSON(b []byte) error {
 	}
 	var StaticRoutes []*types.StaticRoute
 	for _, r := range tStaticRoute {
-		r := r
 		StaticRoutes = append(StaticRoutes, &r)
 	}
 	epj.StaticRoutes = StaticRoutes

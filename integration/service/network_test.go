@@ -115,3 +115,21 @@ func TestDockerNetworkReConnect(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Check(t, is.DeepEqual(n1, n2))
 }
+
+// Check that a swarm-scoped network can't have EnableIPv4=false.
+func TestSwarmNoDisableIPv4(t *testing.T) {
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
+	ctx := setupTest(t)
+
+	d := swarm.NewSwarm(ctx, t, testEnv)
+	defer d.Stop(t)
+	client := d.NewClientT(t)
+	defer client.Close()
+
+	_, err := net.Create(ctx, client, "overlay-v6-only",
+		net.WithDriver("overlay"),
+		net.WithAttachable(),
+		net.WithIPv4(false),
+	)
+	assert.Check(t, is.ErrorContains(err, "IPv4 cannot be disabled in a Swarm scoped network"))
+}

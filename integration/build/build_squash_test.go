@@ -8,6 +8,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	dclient "github.com/docker/docker/client"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -16,6 +17,7 @@ import (
 	"github.com/docker/docker/testutil/fakecontext"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
 )
 
@@ -85,6 +87,8 @@ func TestBuildSquashParent(t *testing.T) {
 		container.WithImage(name),
 		container.WithCmd("/bin/sh", "-c", "cat /hello"),
 	)
+
+	poll.WaitOn(t, container.IsStopped(ctx, client, cid))
 	reader, err := client.ContainerLogs(ctx, cid, containertypes.LogsOptions{
 		ShowStdout: true,
 	})
@@ -105,9 +109,9 @@ func TestBuildSquashParent(t *testing.T) {
 		container.WithCmd("/bin/sh", "-c", `[ "$(echo $HELLO)" = "world" ]`),
 	)
 
-	origHistory, err := client.ImageHistory(ctx, origID)
+	origHistory, err := client.ImageHistory(ctx, origID, image.HistoryOptions{})
 	assert.NilError(t, err)
-	testHistory, err := client.ImageHistory(ctx, name)
+	testHistory, err := client.ImageHistory(ctx, name, image.HistoryOptions{})
 	assert.NilError(t, err)
 
 	inspect, _, err = client.ImageInspectWithRaw(ctx, name)

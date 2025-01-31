@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	eventtypes "github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/image"
@@ -287,7 +286,7 @@ func systemTime(ctx context.Context, t *testing.T, client client.APIClient, test
 }
 
 func systemEventsSince(ctx context.Context, client client.APIClient, since string) (<-chan eventtypes.Message, <-chan error, func()) {
-	eventOptions := types.EventsOptions{
+	eventOptions := eventtypes.ListOptions{
 		Since: since,
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -416,7 +415,7 @@ func TestAuthzPluginEnsureContainerCopyToFrom(t *testing.T) {
 	dstDir, preparedArchive, err := archive.PrepareArchiveCopy(srcArchive, srcInfo, archive.CopyInfo{Path: "/test"})
 	assert.NilError(t, err)
 
-	err = c.CopyToContainer(ctx, cID, dstDir, preparedArchive, types.CopyToContainerOptions{})
+	err = c.CopyToContainer(ctx, cID, dstDir, preparedArchive, containertypes.CopyToContainerOptions{})
 	assert.NilError(t, err)
 
 	rdr, _, err := c.CopyFromContainer(ctx, cID, "/test")
@@ -425,8 +424,8 @@ func TestAuthzPluginEnsureContainerCopyToFrom(t *testing.T) {
 	assert.NilError(t, err)
 }
 
-func imageSave(ctx context.Context, client client.APIClient, path, image string) error {
-	responseReader, err := client.ImageSave(ctx, []string{image})
+func imageSave(ctx context.Context, client client.APIClient, path, imgRef string) error {
+	responseReader, err := client.ImageSave(ctx, []string{imgRef}, image.SaveOptions{})
 	if err != nil {
 		return err
 	}
@@ -446,8 +445,7 @@ func imageLoad(ctx context.Context, client client.APIClient, path string) error 
 		return err
 	}
 	defer file.Close()
-	quiet := true
-	response, err := client.ImageLoad(ctx, file, quiet)
+	response, err := client.ImageLoad(ctx, file, image.LoadOptions{Quiet: true})
 	if err != nil {
 		return err
 	}
@@ -463,7 +461,7 @@ func imageImport(ctx context.Context, client client.APIClient, path string) erro
 	defer file.Close()
 	options := image.ImportOptions{}
 	ref := ""
-	source := types.ImageImportSource{
+	source := image.ImportSource{
 		Source:     file,
 		SourceName: "-",
 	}
