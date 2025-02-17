@@ -209,10 +209,6 @@ func (sr *swarmRouter) createService(ctx context.Context, w http.ResponseWriter,
 	if err := httputils.ReadJSON(r, &service); err != nil {
 		return err
 	}
-	// TODO(thaJeztah): remove logentries check and migration code in release v26.0.0.
-	if service.TaskTemplate.LogDriver != nil && service.TaskTemplate.LogDriver.Name == "logentries" {
-		return errdefs.InvalidParameter(errors.New("the logentries logging driver has been deprecated and removed"))
-	}
 
 	// Get returns "" if the header does not exist
 	encodedAuth := r.Header.Get(registry.AuthHeader)
@@ -222,14 +218,6 @@ func (sr *swarmRouter) createService(ctx context.Context, w http.ResponseWriter,
 			queryRegistry = true
 		}
 		adjustForAPIVersion(v, &service)
-	}
-
-	version := httputils.VersionFromContext(ctx)
-	if versions.LessThan(version, "1.44") {
-		if service.TaskTemplate.ContainerSpec != nil && service.TaskTemplate.ContainerSpec.Healthcheck != nil {
-			// StartInterval was added in API 1.44
-			service.TaskTemplate.ContainerSpec.Healthcheck.StartInterval = 0
-		}
 	}
 
 	resp, err := sr.backend.CreateService(service, encodedAuth, queryRegistry)
@@ -248,10 +236,6 @@ func (sr *swarmRouter) updateService(ctx context.Context, w http.ResponseWriter,
 	var service types.ServiceSpec
 	if err := httputils.ReadJSON(r, &service); err != nil {
 		return err
-	}
-	// TODO(thaJeztah): remove logentries check and migration code in release v26.0.0.
-	if service.TaskTemplate.LogDriver != nil && service.TaskTemplate.LogDriver.Name == "logentries" {
-		return errdefs.InvalidParameter(errors.New("the logentries logging driver has been deprecated and removed"))
 	}
 
 	rawVersion := r.URL.Query().Get("version")

@@ -11,6 +11,7 @@ import (
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/internal/metrics"
 	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
 	"github.com/docker/docker/restartmanager"
 	"github.com/pkg/errors"
@@ -19,16 +20,16 @@ import (
 func (daemon *Daemon) setStateCounter(c *container.Container) {
 	switch c.StateString() {
 	case "paused":
-		stateCtr.set(c.ID, "paused")
+		metrics.StateCtr.Set(c.ID, "paused")
 	case "running":
-		stateCtr.set(c.ID, "running")
+		metrics.StateCtr.Set(c.ID, "running")
 	default:
-		stateCtr.set(c.ID, "stopped")
+		metrics.StateCtr.Set(c.ID, "stopped")
 	}
 }
 
 func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontainerdtypes.EventInfo) error {
-	var exitStatus container.ExitStatus
+	var ctrExitStatus container.ExitStatus
 	c.Lock()
 
 	cfg := daemon.config()
@@ -48,7 +49,7 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 				"container": c.ID,
 			}).Warn("failed to delete container from containerd")
 		} else {
-			exitStatus = container.ExitStatus{
+			ctrExitStatus = container.ExitStatus{
 				ExitCode: int(es.ExitCode()),
 				ExitedAt: es.ExitTime(),
 			}
@@ -62,8 +63,8 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 	c.Reset(false)
 
 	if e != nil {
-		exitStatus.ExitCode = int(e.ExitCode)
-		exitStatus.ExitedAt = e.ExitedAt
+		ctrExitStatus.ExitCode = int(e.ExitCode)
+		ctrExitStatus.ExitedAt = e.ExitedAt
 		if e.Error != nil {
 			c.SetError(e.Error)
 		}
@@ -71,13 +72,13 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 
 	daemonShutdown := daemon.IsShuttingDown()
 	execDuration := time.Since(c.StartedAt)
-	restart, wait, err := c.RestartManager().ShouldRestart(uint32(exitStatus.ExitCode), daemonShutdown || c.HasBeenManuallyStopped, execDuration)
+	restart, wait, err := c.RestartManager().ShouldRestart(uint32(ctrExitStatus.ExitCode), daemonShutdown || c.HasBeenManuallyStopped, execDuration)
 	if err != nil {
 		log.G(ctx).WithFields(log.Fields{
 			"error":                  err,
 			"container":              c.ID,
 			"restartCount":           c.RestartCount,
-			"exitStatus":             exitStatus,
+			"exitStatus":             ctrExitStatus,
 			"daemonShuttingDown":     daemonShutdown,
 			"hasBeenManuallyStopped": c.HasBeenManuallyStopped,
 			"execDuration":           execDuration,
@@ -86,7 +87,7 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 	}
 
 	attributes := map[string]string{
-		"exitCode":     strconv.Itoa(exitStatus.ExitCode),
+		"exitCode":     strconv.Itoa(ctrExitStatus.ExitCode),
 		"execDuration": strconv.Itoa(int(execDuration.Seconds())),
 	}
 	daemon.Cleanup(context.TODO(), c)
@@ -96,12 +97,12 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 		log.G(ctx).WithFields(log.Fields{
 			"container":     c.ID,
 			"restartCount":  c.RestartCount,
-			"exitStatus":    exitStatus,
+			"exitStatus":    ctrExitStatus,
 			"manualRestart": c.HasBeenManuallyRestarted,
 		}).Debug("Restarting container")
-		c.SetRestarting(&exitStatus)
+		c.SetRestarting(&ctrExitStatus)
 	} else {
-		c.SetStopped(&exitStatus)
+		c.SetStopped(&ctrExitStatus)
 		if !c.HasBeenManuallyRestarted {
 			defer daemon.autoRemove(&cfg.Config, c)
 		}
@@ -109,36 +110,36 @@ func (daemon *Daemon) handleContainerExit(c *container.Container, e *libcontaine
 	defer c.Unlock() // needs to be called before autoRemove
 
 	daemon.setStateCounter(c)
-	checkpointErr := c.CheckpointTo(daemon.containersReplica)
+	checkpointErr := c.CheckpointTo(context.TODO(), daemon.containersReplica)
 
 	daemon.LogContainerEventWithAttributes(c, events.ActionDie, attributes)
 
 	if restart {
 		go func() {
-			err := <-wait
-			if err == nil {
+			waitErr := <-wait
+			if waitErr == nil {
 				// daemon.netController is initialized when daemon is restoring containers.
 				// But containerStart will use daemon.netController segment.
 				// So to avoid panic at startup process, here must wait util daemon restore done.
 				daemon.waitForStartupDone()
-				cfg := daemon.config() // Apply the most up-to-date daemon config to the restarted container.
 
-				// update the error if we fail to start the container, so that the cleanup code
-				// below can handle updating the container's status, and auto-remove (if set).
-				err = daemon.containerStart(context.Background(), cfg, c, "", "", false)
-				if err != nil {
-					log.G(ctx).Debugf("failed to restart container: %+v", err)
+				// Apply the most up-to-date daemon config to the restarted container.
+				if err := daemon.containerStart(context.Background(), daemon.config(), c, "", "", false); err != nil {
+					// update the error if we fail to start the container, so that the cleanup code
+					// below can handle updating the container's status, and auto-remove (if set).
+					waitErr = err
+					log.G(ctx).Debugf("failed to restart container: %+v", waitErr)
 				}
 			}
-			if err != nil {
+			if waitErr != nil {
 				c.Lock()
-				c.SetStopped(&exitStatus)
+				c.SetStopped(&ctrExitStatus)
 				daemon.setStateCounter(c)
-				c.CheckpointTo(daemon.containersReplica)
+				c.CheckpointTo(context.TODO(), daemon.containersReplica)
 				c.Unlock()
 				defer daemon.autoRemove(&cfg.Config, c)
-				if err != restartmanager.ErrRestartCanceled {
-					log.G(ctx).Errorf("restartmanger wait error: %+v", err)
+				if waitErr != restartmanager.ErrRestartCanceled {
+					log.G(ctx).Errorf("restartmanger wait error: %+v", waitErr)
 				}
 			}
 		}()
@@ -165,11 +166,12 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 		defer c.Unlock()
 		c.OOMKilled = true
 		daemon.updateHealthMonitor(c)
-		if err := c.CheckpointTo(daemon.containersReplica); err != nil {
+		if err := c.CheckpointTo(context.TODO(), daemon.containersReplica); err != nil {
 			return err
 		}
 
 		daemon.LogContainerEvent(c, events.ActionOOM)
+		return nil
 	case libcontainerdtypes.EventExit:
 		if ei.ProcessID == ei.ContainerID {
 			return daemon.handleContainerExit(c, &ei)
@@ -205,7 +207,7 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 			// with daemon.ContainerExecStart() removing the exec from
 			// c.ExecCommands. If we win the race, we will find that there is no
 			// process to clean up. (And ContainerExecStart will clobber the
-			// exit code we set.) Prevent a nil-dereferenc panic in that
+			// exit code we set.) Prevent a nil-dereference panic in that
 			// situation to restore the status quo where this is merely a
 			// logical race condition.
 			if execConfig.Process != nil {
@@ -224,6 +226,7 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 			"execID":   ei.ProcessID,
 			"exitCode": strconv.Itoa(exitCode),
 		})
+		return nil
 	case libcontainerdtypes.EventStart:
 		c.Lock()
 		defer c.Unlock()
@@ -254,19 +257,20 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 				}
 				return err
 			}
-			c.SetRunning(ctr, tsk, false)
+			c.SetRunningExternal(ctr, tsk)
 			c.HasBeenManuallyStopped = false
 			c.HasBeenStartedBefore = true
 			daemon.setStateCounter(c)
 
 			daemon.initHealthMonitor(c)
 
-			if err := c.CheckpointTo(daemon.containersReplica); err != nil {
+			if err := c.CheckpointTo(context.TODO(), daemon.containersReplica); err != nil {
 				return err
 			}
 			daemon.LogContainerEvent(c, events.ActionStart)
 		}
 
+		return nil
 	case libcontainerdtypes.EventPaused:
 		c.Lock()
 		defer c.Unlock()
@@ -275,11 +279,12 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 			c.Paused = true
 			daemon.setStateCounter(c)
 			daemon.updateHealthMonitor(c)
-			if err := c.CheckpointTo(daemon.containersReplica); err != nil {
+			if err := c.CheckpointTo(context.TODO(), daemon.containersReplica); err != nil {
 				return err
 			}
 			daemon.LogContainerEvent(c, events.ActionPause)
 		}
+		return nil
 	case libcontainerdtypes.EventResumed:
 		c.Lock()
 		defer c.Unlock()
@@ -289,13 +294,16 @@ func (daemon *Daemon) ProcessEvent(id string, e libcontainerdtypes.EventType, ei
 			daemon.setStateCounter(c)
 			daemon.updateHealthMonitor(c)
 
-			if err := c.CheckpointTo(daemon.containersReplica); err != nil {
+			if err := c.CheckpointTo(context.TODO(), daemon.containersReplica); err != nil {
 				return err
 			}
 			daemon.LogContainerEvent(c, events.ActionUnPause)
 		}
+		return nil
+	default:
+		// TODO(thaJeztah): make switch exhaustive; add types.EventUnknown, types.EventCreate, types.EventExecAdded, types.EventExecStarted
+		return nil
 	}
-	return nil
 }
 
 func (daemon *Daemon) autoRemove(cfg *config.Config, c *container.Container) {
@@ -307,12 +315,11 @@ func (daemon *Daemon) autoRemove(cfg *config.Config, c *container.Container) {
 	}
 
 	err := daemon.containerRm(cfg, c.ID, &backend.ContainerRmConfig{ForceRemove: true, RemoveVolume: true})
-	if err == nil {
-		return
+	if err != nil {
+		if daemon.containers.Get(c.ID) == nil {
+			// container no longer found, so remove worked after all.
+			return
+		}
+		log.G(context.TODO()).WithFields(log.Fields{"error": err, "container": c.ID}).Error("error removing container")
 	}
-	if c := daemon.containers.Get(c.ID); c == nil {
-		return
-	}
-
-	log.G(context.TODO()).WithFields(log.Fields{"error": err, "container": c.ID}).Error("error removing container")
 }

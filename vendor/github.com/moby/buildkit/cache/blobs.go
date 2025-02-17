@@ -3,14 +3,15 @@ package cache
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"strconv"
 
-	"github.com/containerd/containerd/diff"
-	"github.com/containerd/containerd/diff/walking"
-	"github.com/containerd/containerd/labels"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	"github.com/containerd/containerd/v2/plugins/diff/walking"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
@@ -232,9 +233,7 @@ func computeBlobChain(ctx context.Context, sr *immutableRef, createIfNeeded bool
 					if err != nil {
 						return nil, errors.Wrapf(err, "failed to finalize compression")
 					}
-					for k, v := range a {
-						desc.Annotations[k] = v
-					}
+					maps.Copy(desc.Annotations, a)
 				}
 				info, err := sr.cm.ContentStore.Info(ctx, desc.Digest)
 				if err != nil {

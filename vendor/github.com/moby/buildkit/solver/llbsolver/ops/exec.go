@@ -11,7 +11,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/platforms"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/executor"
 	resourcestypes "github.com/moby/buildkit/executor/resources/types"
@@ -78,27 +78,8 @@ func (e *ExecOp) Proto() *pb.ExecOp {
 	return e.op
 }
 
-func cloneExecOp(old *pb.ExecOp) pb.ExecOp {
-	n := *old
-	meta := *n.Meta
-	meta.ExtraHosts = nil
-	for i := range n.Meta.ExtraHosts {
-		h := *n.Meta.ExtraHosts[i]
-		meta.ExtraHosts = append(meta.ExtraHosts, &h)
-	}
-	n.Meta = &meta
-	n.Mounts = nil
-	for i := range old.Mounts {
-		m := *old.Mounts[i]
-
-		if m.CacheOpt != nil {
-			co := *m.CacheOpt
-			m.CacheOpt = &co
-		}
-
-		n.Mounts = append(n.Mounts, &m)
-	}
-	return n
+func cloneExecOp(old *pb.ExecOp) *pb.ExecOp {
+	return old.CloneVT()
 }
 
 func checkShouldClearCacheOpts(m *pb.Mount) bool {
@@ -179,7 +160,7 @@ func (e *ExecOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 		OSFeatures []string `json:",omitempty"`
 	}{
 		Type:       execCacheType,
-		Exec:       &op,
+		Exec:       op,
 		OS:         p.OS,
 		Arch:       p.Architecture,
 		Variant:    p.Variant,
@@ -216,6 +197,22 @@ func (e *ExecOp) CacheMap(ctx context.Context, g session.Group, index int) (*sol
 			cm.Deps[i].ComputeDigestFunc = opsutils.NewContentHashFunc(toSelectors(dedupePaths(dep.Selectors)))
 		}
 		cm.Deps[i].PreprocessFunc = unlazyResultFunc
+	}
+
+	if e.w != nil && e.w.CDIManager() != nil {
+		for _, d := range e.op.CdiDevices {
+			setup, ok := e.w.CDIManager().OnDemandInstaller(d.Name)
+			if ok {
+				prev := cm.Deps[0].PreprocessFunc
+				cm.Deps[0].PreprocessFunc = func(ctx context.Context, r solver.Result, g session.Group) error {
+					if err := prev(ctx, r, g); err != nil {
+						return err
+					}
+					// we could pass glibc/musl type in here based on rootfs to get correct dynamic libs
+					return setup(ctx)
+				}
+			}
+		}
 	}
 
 	return cm, true, nil
@@ -285,7 +282,12 @@ type dep struct {
 func (e *ExecOp) getMountDeps() ([]dep, error) {
 	deps := make([]dep, e.numInputs)
 	for _, m := range e.op.Mounts {
-		if m.Input == pb.Empty {
+		switch m.MountType {
+		case pb.MountType_SECRET, pb.MountType_SSH, pb.MountType_TMPFS:
+			continue
+		}
+
+		if m.Input == int64(pb.Empty) {
 			continue
 		}
 		if int(m.Input) >= len(deps) {
@@ -309,7 +311,7 @@ func (e *ExecOp) getMountDeps() ([]dep, error) {
 		//   run, since we only select "bar"
 		// - But this cached result is incorrect - "foo/sneaky.txt" isn't in
 		//   our cached result, but it is in our input.
-		if m.Output == pb.SkipOutput {
+		if m.Output == int64(pb.SkipOutput) {
 			// if the mount has no outputs, it's safe to enable content-based
 			// caching, since it's guaranteed to not be used as an input for
 			// any future steps
@@ -423,7 +425,7 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		return nil, err
 	}
 
-	emu, err := getEmulator(ctx, e.platform, e.cm.IdentityMapping())
+	emu, err := getEmulator(ctx, e.platform)
 	if err != nil {
 		return nil, err
 	}
@@ -446,6 +448,7 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		ReadonlyRootFS:            p.ReadonlyRootFS,
 		ExtraHosts:                extraHosts,
 		Ulimit:                    e.op.Meta.Ulimit,
+		CDIDevices:                e.op.CdiDevices,
 		CgroupParent:              e.op.Meta.CgroupParent,
 		NetMode:                   e.op.Network,
 		SecurityMode:              e.op.Security,
@@ -466,6 +469,13 @@ func (e *ExecOp) Exec(ctx context.Context, g session.Group, inputs []solver.Resu
 		return nil, err
 	}
 	meta.Env = append(meta.Env, secretEnv...)
+
+	if e.op.Meta.ValidExitCodes != nil {
+		meta.ValidExitCodes = make([]int, len(e.op.Meta.ValidExitCodes))
+		for i, code := range e.op.Meta.ValidExitCodes {
+			meta.ValidExitCodes[i] = int(code)
+		}
+	}
 
 	stdout, stderr, flush := logs.NewLogStreams(ctx, os.Getenv("BUILDKIT_DEBUG_EXEC_OUTPUT") == "1")
 	defer stdout.Close()
