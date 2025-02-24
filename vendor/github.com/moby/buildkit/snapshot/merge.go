@@ -4,12 +4,12 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/pkg/userns"
-	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/leaseutil"
+	"github.com/moby/sys/userns"
 	"github.com/pkg/errors"
 )
 

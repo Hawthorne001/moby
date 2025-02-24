@@ -5,21 +5,21 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	cerrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/plugin"
-	"github.com/containerd/containerd/remotes/docker"
-	"github.com/containerd/containerd/snapshots"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/plugins"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
+	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
 	"github.com/docker/docker/container"
 	daemonevents "github.com/docker/docker/daemon/events"
 	dimages "github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/daemon/snapshotter"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/registry"
 	"github.com/pkg/errors"
@@ -28,7 +28,7 @@ import (
 // ImageService implements daemon.ImageService
 type ImageService struct {
 	client              *containerd.Client
-	images              images.Store
+	images              c8dimages.Store
 	content             content.Store
 	containers          container.Store
 	snapshotterServices map[string]snapshots.Snapshotter
@@ -39,6 +39,9 @@ type ImageService struct {
 	pruneRunning        atomic.Bool
 	refCountMounter     snapshotter.Mounter
 	idMapping           idtools.IdentityMapping
+
+	// defaultPlatformOverride is used in tests to override the host platform.
+	defaultPlatformOverride platforms.MatchComparer
 }
 
 type registryResolver interface {
@@ -104,24 +107,17 @@ func (i *ImageService) CountImages(ctx context.Context) int {
 	return len(imgs)
 }
 
-// CreateLayer creates a filesystem layer for a container.
-// called from create.go
-// TODO: accept an opt struct instead of container?
-func (i *ImageService) CreateLayer(container *container.Container, initFunc layer.MountInit) (layer.RWLayer, error) {
-	return nil, errdefs.NotImplemented(errdefs.NotImplemented(errors.New("not implemented")))
-}
-
 // LayerStoreStatus returns the status for each layer store
 // called from info.go
 func (i *ImageService) LayerStoreStatus() [][2]string {
 	// TODO(thaJeztah) do we want to add more details about the driver here?
 	return [][2]string{
-		{"driver-type", string(plugin.SnapshotPlugin)},
+		{"driver-type", string(plugins.SnapshotPlugin)},
 	}
 }
 
 // GetLayerMountID returns the mount ID for a layer
-// called from daemon.go Daemon.Shutdown(), and Daemon.Cleanup() (cleanup is actually continerCleanup)
+// called from daemon.go Daemon.Shutdown(), and Daemon.Cleanup() (cleanup is actually containerCleanup)
 // TODO: needs to be refactored to Unmount (see callers), or removed and replaced with GetLayerByID
 func (i *ImageService) GetLayerMountID(cid string) (string, error) {
 	return "", errdefs.NotImplemented(errors.New("not implemented"))
@@ -137,12 +133,6 @@ func (i *ImageService) Cleanup() error {
 // used by the ImageService.
 func (i *ImageService) StorageDriver() string {
 	return i.snapshotter
-}
-
-// ReleaseLayer releases a layer allowing it to be removed
-// called from delete.go Daemon.cleanupContainer(), and Daemon.containerExport()
-func (i *ImageService) ReleaseLayer(rwlayer layer.RWLayer) error {
-	return errdefs.NotImplemented(errors.New("not implemented"))
 }
 
 // LayerDiskUsage returns the number of bytes used by layer stores

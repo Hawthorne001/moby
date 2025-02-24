@@ -40,7 +40,7 @@ type TransportPort struct {
 	Port  uint16
 }
 
-// Equal checks if this instance of Transportport is equal to the passed one
+// Equal checks if this instance of TransportPort is equal to the passed one
 func (t *TransportPort) Equal(o *TransportPort) bool {
 	if t == o {
 		return true
@@ -117,18 +117,48 @@ func (p *PortBinding) GetCopy() PortBinding {
 	}
 }
 
-// String returns the PortBinding structure in string form
-func (p *PortBinding) String() string {
-	ret := fmt.Sprintf("%s/", p.Proto)
-	if p.IP != nil {
-		ret += p.IP.String()
+// String returns the PortBinding structure in the form "HostIP:HostPort:IP:Port/Proto",
+// omitting un-set fields apart from Port.
+func (p PortBinding) String() string {
+	var ret strings.Builder
+	if len(p.HostIP) > 0 {
+		is6 := p.HostIP.To4() == nil
+		if is6 {
+			ret.WriteRune('[')
+		}
+		ret.WriteString(p.HostIP.String())
+		if is6 {
+			ret.WriteRune(']')
+		}
+		ret.WriteRune(':')
 	}
-	ret = fmt.Sprintf("%s:%d/", ret, p.Port)
-	if p.HostIP != nil {
-		ret += p.HostIP.String()
+	if p.HostPort != 0 {
+		ret.WriteString(strconv.Itoa(int(p.HostPort)))
+		if p.HostPortEnd != 0 && p.HostPortEnd != p.HostPort {
+			ret.WriteRune('-')
+			ret.WriteString(strconv.Itoa(int(p.HostPortEnd)))
+		}
 	}
-	ret = fmt.Sprintf("%s:%d", ret, p.HostPort)
-	return ret
+	if ret.Len() > 0 {
+		ret.WriteRune(':')
+	}
+	if len(p.IP) > 0 {
+		is6 := p.IP.To4() == nil
+		if is6 {
+			ret.WriteRune('[')
+		}
+		ret.WriteString(p.IP.String())
+		if is6 {
+			ret.WriteRune(']')
+		}
+		ret.WriteRune(':')
+	}
+	ret.WriteString(strconv.Itoa(int(p.Port)))
+	if p.Proto != 0 {
+		ret.WriteRune('/')
+		ret.WriteString(p.Proto.String())
+	}
+	return ret.String()
 }
 
 const (
@@ -238,7 +268,7 @@ var v4inV6MaskPrefix = []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x
 // compareIPMask checks if the passed ip and mask are semantically compatible.
 // It returns the byte indexes for the address and mask so that caller can
 // do bitwise operations without modifying address representation.
-func compareIPMask(ip net.IP, mask net.IPMask) (is int, ms int, err error) {
+func compareIPMask(ip net.IP, mask net.IPMask) (is int, ms int, _ error) {
 	// Find the effective starting of address and mask
 	if len(ip) == net.IPv6len && ip.To4() != nil {
 		is = 12
@@ -248,9 +278,9 @@ func compareIPMask(ip net.IP, mask net.IPMask) (is int, ms int, err error) {
 	}
 	// Check if address and mask are semantically compatible
 	if len(ip[is:]) != len(mask[ms:]) {
-		err = fmt.Errorf("ip and mask are not compatible: (%#v, %#v)", ip, mask)
+		return 0, 0, fmt.Errorf("ip and mask are not compatible: (%s, %s)", ip, mask)
 	}
-	return
+	return is, ms, nil
 }
 
 // GetHostPartIP returns the host portion of the ip address identified by the mask.
@@ -357,34 +387,19 @@ type MaskableError interface {
 }
 
 // InvalidParameterError is an interface for errors originated by a bad request
-type InvalidParameterError interface {
-	// InvalidParameter makes implementer into InvalidParameterError type
-	InvalidParameter()
-}
+type InvalidParameterError = errdefs.ErrInvalidParameter
 
 // NotFoundError is an interface for errors raised because a needed resource is not available
-type NotFoundError interface {
-	// NotFound makes implementer into NotFoundError type
-	NotFound()
-}
+type NotFoundError = errdefs.ErrNotFound
 
 // ForbiddenError is an interface for errors which denote a valid request that cannot be honored
-type ForbiddenError interface {
-	// Forbidden makes implementer into ForbiddenError type
-	Forbidden()
-}
+type ForbiddenError = errdefs.ErrForbidden
 
 // UnavailableError is an interface for errors returned when the required service is not available
-type UnavailableError interface {
-	// Unavailable makes implementer into UnavailableError type
-	Unavailable()
-}
+type UnavailableError = errdefs.ErrUnavailable
 
 // NotImplementedError is an interface for errors raised because of requested functionality is not yet implemented
-type NotImplementedError interface {
-	// NotImplemented makes implementer into NotImplementedError type
-	NotImplemented()
-}
+type NotImplementedError = errdefs.ErrNotImplemented
 
 // InternalError is an interface for errors raised because of an internal error
 type InternalError interface {
@@ -403,22 +418,22 @@ func InvalidParameterErrorf(format string, params ...interface{}) error {
 
 // NotFoundErrorf creates an instance of NotFoundError
 func NotFoundErrorf(format string, params ...interface{}) error {
-	return notFound(fmt.Sprintf(format, params...))
+	return errdefs.NotFound(fmt.Errorf(format, params...))
 }
 
 // ForbiddenErrorf creates an instance of ForbiddenError
 func ForbiddenErrorf(format string, params ...interface{}) error {
-	return forbidden(fmt.Sprintf(format, params...))
+	return errdefs.Forbidden(fmt.Errorf(format, params...))
 }
 
 // UnavailableErrorf creates an instance of UnavailableError
 func UnavailableErrorf(format string, params ...interface{}) error {
-	return unavailable(fmt.Sprintf(format, params...))
+	return errdefs.Unavailable(fmt.Errorf(format, params...))
 }
 
 // NotImplementedErrorf creates an instance of NotImplementedError
 func NotImplementedErrorf(format string, params ...interface{}) error {
-	return notImpl(fmt.Sprintf(format, params...))
+	return errdefs.NotImplemented(fmt.Errorf(format, params...))
 }
 
 // InternalErrorf creates an instance of InternalError
@@ -434,33 +449,6 @@ func InternalMaskableErrorf(format string, params ...interface{}) error {
 /***********************
  * Internal Error Types
  ***********************/
-type notFound string
-
-func (nf notFound) Error() string {
-	return string(nf)
-}
-func (nf notFound) NotFound() {}
-
-type forbidden string
-
-func (frb forbidden) Error() string {
-	return string(frb)
-}
-func (frb forbidden) Forbidden() {}
-
-type unavailable string
-
-func (ns unavailable) Error() string {
-	return string(ns)
-}
-func (ns unavailable) Unavailable() {}
-
-type notImpl string
-
-func (ni notImpl) Error() string {
-	return string(ni)
-}
-func (ni notImpl) NotImplemented() {}
 
 type internal string
 

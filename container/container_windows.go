@@ -6,11 +6,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/pkg/system"
 )
 
 const (
@@ -18,9 +16,6 @@ const (
 	containerSecretMountPath         = `C:\ProgramData\Docker\secrets`
 	containerInternalSecretMountPath = `C:\ProgramData\Docker\internal\secrets`
 	containerInternalConfigsDirPath  = `C:\ProgramData\Docker\internal\configs`
-
-	// defaultStopSignal is the default syscall signal used to stop a container.
-	defaultStopSignal = "SIGTERM"
 
 	// defaultStopTimeout is the timeout (in seconds) for the shutdown call on a container
 	defaultStopTimeout = 30
@@ -47,7 +42,7 @@ func (container *Container) CreateSecretSymlinks() error {
 		if err != nil {
 			return err
 		}
-		if err := system.MkdirAll(filepath.Dir(resolvedPath), 0); err != nil {
+		if err := os.MkdirAll(filepath.Dir(resolvedPath), 0); err != nil {
 			return err
 		}
 		if err := os.Symlink(filepath.Join(containerInternalSecretMountPath, r.SecretID), resolvedPath); err != nil {
@@ -97,7 +92,7 @@ func (container *Container) CreateConfigSymlinks() error {
 		if err != nil {
 			return err
 		}
-		if err := system.MkdirAll(filepath.Dir(resolvedPath), 0); err != nil {
+		if err := os.MkdirAll(filepath.Dir(resolvedPath), 0); err != nil {
 			return err
 		}
 		if err := os.Symlink(filepath.Join(containerInternalConfigsDirPath, configRef.ConfigID), resolvedPath); err != nil {
@@ -188,10 +183,10 @@ func (container *Container) BuildHostnameFile() error {
 }
 
 // GetMountPoints gives a platform specific transformation to types.MountPoint. Callers must hold a Container lock.
-func (container *Container) GetMountPoints() []types.MountPoint {
-	mountPoints := make([]types.MountPoint, 0, len(container.MountPoints))
+func (container *Container) GetMountPoints() []containertypes.MountPoint {
+	mountPoints := make([]containertypes.MountPoint, 0, len(container.MountPoints))
 	for _, m := range container.MountPoints {
-		mountPoints = append(mountPoints, types.MountPoint{
+		mountPoints = append(mountPoints, containertypes.MountPoint{
 			Type:        m.Type,
 			Name:        m.Name,
 			Source:      m.Path(),

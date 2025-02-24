@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/docker/docker/api"
 	containertypes "github.com/docker/docker/api/types/container"
@@ -14,9 +13,11 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/pkg/parsers/kernel"
 	"github.com/docker/docker/testutil"
+	"github.com/docker/docker/volume"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"gotest.tools/v3/assert"
@@ -25,6 +26,10 @@ import (
 	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
 )
+
+// testNonExistingPlugin is a special plugin-name, which overrides defaultTimeOut in tests.
+// this is a copy of https://github.com/moby/moby/blob/9e00a63d65434cdedc444e79a2b33a7c202b10d8/pkg/plugins/client.go#L253-L254
+const testNonExistingPlugin = "this-plugin-does-not-exist"
 
 func TestContainerNetworkMountsNoChown(t *testing.T) {
 	// chown only applies to Linux bind mounted volumes; must be same host to verify
@@ -265,7 +270,7 @@ func TestContainerBindMountNonRecursive(t *testing.T) {
 	}
 
 	for _, c := range containers {
-		poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, c), poll.WithDelay(100*time.Millisecond))
+		poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, c))
 	}
 }
 
@@ -311,7 +316,7 @@ func TestContainerVolumesMountedAsShared(t *testing.T) {
 
 	apiClient := testEnv.APIClient()
 	containerID := container.Run(ctx, t, apiClient, container.WithPrivileged(true), container.WithMount(sharedMount), container.WithCmd(bindMountCmd...))
-	poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, containerID), poll.WithDelay(100*time.Millisecond))
+	poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, containerID))
 
 	// Make sure a bind mount under a shared volume propagated to host.
 	if mounted, _ := mountinfo.Mounted(tmpDir1Mnt); !mounted {
@@ -391,6 +396,60 @@ func TestContainerVolumesMountedAsSlave(t *testing.T) {
 	} else {
 		t.Fatal(err)
 	}
+}
+
+// TestContainerVolumeAnonymous verifies that anonymous volumes created through
+// the Mounts API get a random name generated, and have the "AnonymousLabel"
+// (com.docker.volume.anonymous) label set.
+//
+// regression test for https://github.com/moby/moby/issues/48748
+func TestContainerVolumeAnonymous(t *testing.T) {
+	skip.If(t, testEnv.IsRemoteDaemon)
+
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	t.Run("no driver specified", func(t *testing.T) {
+		mntOpts := mounttypes.Mount{Type: mounttypes.TypeVolume, Target: "/foo"}
+		cID := container.Create(ctx, t, apiClient, container.WithMount(mntOpts))
+
+		inspect := container.Inspect(ctx, t, apiClient, cID)
+		assert.Assert(t, is.Len(inspect.HostConfig.Mounts, 1))
+		assert.Check(t, is.Equal(inspect.HostConfig.Mounts[0], mntOpts))
+
+		assert.Assert(t, is.Len(inspect.Mounts, 1))
+		vol := inspect.Mounts[0]
+		assert.Check(t, is.Len(vol.Name, 64), "volume name should be 64 bytes (from stringid.GenerateRandomID())")
+		assert.Check(t, is.Equal(vol.Driver, volume.DefaultDriverName))
+
+		volInspect, err := apiClient.VolumeInspect(ctx, vol.Name)
+		assert.NilError(t, err)
+
+		// see [daemon.AnonymousLabel]; we don't want to import the daemon package here.
+		const expectedAnonymousLabel = "com.docker.volume.anonymous"
+		assert.Check(t, is.Contains(volInspect.Labels, expectedAnonymousLabel))
+		assert.Check(t, is.Equal(volInspect.Driver, volume.DefaultDriverName))
+	})
+
+	// Verify that specifying a custom driver is still taken into account.
+	t.Run("custom driver", func(t *testing.T) {
+		config := container.NewTestConfig(container.WithMount(mounttypes.Mount{
+			Type:   mounttypes.TypeVolume,
+			Target: "/foo",
+			VolumeOptions: &mounttypes.VolumeOptions{
+				DriverConfig: &mounttypes.Driver{
+					Name: testNonExistingPlugin,
+				},
+			},
+		}))
+		_, err := apiClient.ContainerCreate(ctx, config.Config, config.HostConfig, config.NetworkingConfig, config.Platform, config.Name)
+		// We use [testNonExistingPlugin] for this, which produces an error
+		// when used, which we use as indicator that the driver was passed
+		// through. We should have a cleaner way for this, but that would
+		// require a custom volume plugin to be installed.
+		assert.Check(t, is.ErrorType(err, errdefs.IsNotFound))
+		assert.Check(t, is.ErrorContains(err, fmt.Sprintf(`plugin %q not found`, testNonExistingPlugin)))
+	})
 }
 
 // Regression test for #38995 and #43390.
@@ -574,7 +633,7 @@ func TestContainerBindMountRecursivelyReadOnly(t *testing.T) {
 	}
 
 	for _, c := range containers {
-		poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, c), poll.WithDelay(100*time.Millisecond))
+		poll.WaitOn(t, container.IsSuccessful(ctx, apiClient, c))
 	}
 }
 

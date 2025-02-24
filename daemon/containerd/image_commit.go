@@ -10,17 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/diff"
-	cerrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/pkg/cleanup"
-	"github.com/containerd/containerd/snapshots"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/image"
-	"github.com/docker/docker/internal/compatcontext"
 	"github.com/docker/docker/pkg/archive"
 	imagespec "github.com/moby/docker-image-spec/specs-go/v1"
 	"github.com/opencontainers/go-digest"
@@ -68,16 +65,11 @@ func (i *ImageService) CommitImage(ctx context.Context, cc backend.CommitConfig)
 		sn     = i.client.SnapshotService(container.Driver)
 	)
 
-	// Don't gc me and clean the dirty data after 1 hour!
-	ctx, release, err := i.client.WithLease(ctx, leases.WithRandomID(), leases.WithExpiration(1*time.Hour))
+	ctx, release, err := i.withLease(ctx, false)
 	if err != nil {
 		return "", fmt.Errorf("failed to create lease for commit: %w", err)
 	}
-	defer func() {
-		if err := release(compatcontext.WithoutCancel(ctx)); err != nil {
-			log.G(ctx).WithError(err).Warn("failed to release lease created for commit")
-		}
-	}()
+	defer release()
 
 	diffLayerDesc, diffID, err := i.createDiff(ctx, cc.ContainerID, sn, cs, differ)
 	if err != nil {
@@ -206,7 +198,7 @@ func (i *ImageService) createDiff(ctx context.Context, name string, sn snapshots
 			if err != nil {
 				return nil, "", err
 			}
-			defer cleanup.Do(ctx, func(ctx context.Context) {
+			defer cleanup(ctx, func(ctx context.Context) {
 				sn.Remove(ctx, upperKey)
 			})
 		}
@@ -217,7 +209,7 @@ func (i *ImageService) createDiff(ctx context.Context, name string, sn snapshots
 	if err != nil {
 		return nil, "", err
 	}
-	defer cleanup.Do(ctx, func(ctx context.Context) {
+	defer cleanup(ctx, func(ctx context.Context) {
 		sn.Remove(ctx, lowerKey)
 	})
 
@@ -310,6 +302,12 @@ func uniquePart() string {
 	return fmt.Sprintf("%d-%s", t.Nanosecond(), base64.URLEncoding.EncodeToString(b[:]))
 }
 
+func cleanup(ctx context.Context, do func(context.Context)) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	do(ctx)
+	cancel()
+}
+
 // CommitBuildStep is used by the builder to create an image for each step in
 // the build.
 //
@@ -326,7 +324,7 @@ func (i *ImageService) CommitBuildStep(ctx context.Context, c backend.CommitConf
 		return "", fmt.Errorf("container not found: %s", c.ContainerID)
 	}
 	c.ContainerMountLabel = ctr.MountLabel
-	c.ContainerOS = ctr.OS
+	c.ContainerOS = ctr.ImagePlatform.OS
 	c.ParentImageID = string(ctr.ImageID)
 	return i.CommitImage(ctx, c)
 }

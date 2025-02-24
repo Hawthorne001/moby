@@ -8,15 +8,18 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/oci"
-	cdseccomp "github.com/containerd/containerd/pkg/seccomp"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/apparmor"
+	"github.com/containerd/containerd/v2/pkg/oci"
+	cdseccomp "github.com/containerd/containerd/v2/pkg/seccomp"
 	"github.com/containerd/continuity/fs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/profiles/seccomp"
 	"github.com/moby/buildkit/snapshot"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/entitlements/security"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	selinux "github.com/opencontainers/selinux/go-selinux"
@@ -38,14 +41,14 @@ func withProcessArgs(args ...string) oci.SpecOpts {
 	return oci.WithProcessArgs(args...)
 }
 
-func generateMountOpts(resolvConf, hostsFile string) ([]oci.SpecOpts, error) {
+func generateMountOpts(resolvConf, hostsFile string) []oci.SpecOpts {
 	return []oci.SpecOpts{
 		// https://github.com/moby/buildkit/issues/429
 		withRemovedMount("/run"),
 		withROBind(resolvConf, "/etc/resolv.conf"),
 		withROBind(hostsFile, "/etc/hosts"),
 		withCGroup(),
-	}, nil
+	}
 }
 
 // generateSecurityOpts may affect mounts, so must be called after generateMountOpts
@@ -72,6 +75,11 @@ func generateSecurityOpts(mode pb.SecurityMode, apparmorProfile string, selinuxB
 			opts = append(opts, withDefaultProfile())
 		}
 		if apparmorProfile != "" {
+			// If AppArmor is not supported but a profile was specified, return an error
+			if !apparmor.HostSupports() {
+				return nil, errors.New("AppArmor is not supported on this host, but the profile '" + apparmorProfile + "' was specified")
+			}
+
 			opts = append(opts, oci.WithApparmorProfile(apparmorProfile))
 		}
 		opts = append(opts, func(_ context.Context, _ oci.Client, _ *containers.Container, s *oci.Spec) error {
@@ -139,6 +147,34 @@ func generateRlimitOpts(ulimits []*pb.Ulimit) ([]oci.SpecOpts, error) {
 			s.Process.Rlimits = rlimits
 			return nil
 		},
+	}, nil
+}
+
+// genereateCDIOptions creates the OCI runtime spec options for injecting CDI
+// devices.
+func generateCDIOpts(manager *cdidevices.Manager, devs []*pb.CDIDevice) ([]oci.SpecOpts, error) {
+	if len(devs) == 0 {
+		return nil, nil
+	}
+
+	withCDIDevices := func(devs []*pb.CDIDevice) oci.SpecOpts {
+		return func(ctx context.Context, _ oci.Client, c *containers.Container, s *specs.Spec) error {
+			if err := manager.Refresh(); err != nil {
+				bklog.G(ctx).Warnf("CDI registry refresh failed: %v", err)
+			}
+			if err := manager.InjectDevices(s, devs...); err != nil {
+				return errors.Wrapf(err, "CDI device injection failed")
+			}
+			// One crucial thing to keep in mind is that CDI device injection
+			// might add OCI Spec environment variables, hooks, and mounts as
+			// well. Therefore, it is important that none of the corresponding
+			// OCI Spec fields are reset up in the call stack once we return.
+			return nil
+		}
+	}
+
+	return []oci.SpecOpts{
+		withCDIDevices(devs),
 	}, nil
 }
 
@@ -260,13 +296,13 @@ func sub(m mount.Mount, subPath string) (mount.Mount, func() error, error) {
 		// similar to runc.WithProcfd
 		fh, err := os.OpenFile(src, unix.O_PATH|unix.O_CLOEXEC, 0)
 		if err != nil {
-			return mount.Mount{}, nil, err
+			return mount.Mount{}, nil, errors.WithStack(err)
 		}
 
 		fdPath := "/proc/self/fd/" + strconv.Itoa(int(fh.Fd()))
 		if resolved, err := os.Readlink(fdPath); err != nil {
 			fh.Close()
-			return mount.Mount{}, nil, err
+			return mount.Mount{}, nil, errors.WithStack(err)
 		} else if resolved != src {
 			retries--
 			if retries <= 0 {

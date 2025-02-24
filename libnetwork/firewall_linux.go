@@ -2,6 +2,7 @@ package libnetwork
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/containerd/log"
@@ -10,24 +11,24 @@ import (
 
 const userChain = "DOCKER-USER"
 
-var ctrl *Controller
-
-func setupArrangeUserFilterRule(c *Controller) {
-	ctrl = c
-	iptables.OnReloaded(arrangeUserFilterRule)
-}
-
-// arrangeUserFilterRule sets up the DOCKER-USER chain for each iptables version
-// (IPv4, IPv6) that's enabled in the controller's configuration.
-func arrangeUserFilterRule() {
-	if ctrl == nil {
-		return
-	}
-	for _, ipVersion := range ctrl.enabledIptablesVersions() {
-		if err := setupUserChain(ipVersion); err != nil {
-			log.G(context.TODO()).WithError(err).Warn("arrangeUserFilterRule")
+// Sets up the DOCKER-USER chain for each iptables version (IPv4, IPv6) that's
+// enabled in the controller's configuration.
+func (c *Controller) setupUserChains() {
+	setup := func() error {
+		var errs []error
+		for _, ipVersion := range c.enabledIptablesVersions() {
+			errs = append(errs, setupUserChain(ipVersion))
 		}
+		return errors.Join(errs...)
 	}
+	if err := setup(); err != nil {
+		log.G(context.Background()).WithError(err).Warn("configuring " + userChain)
+	}
+	iptables.OnReloaded(func() {
+		if err := setup(); err != nil {
+			log.G(context.Background()).WithError(err).Warn("configuring " + userChain + " on firewall reload")
+		}
+	})
 }
 
 // setupUserChain sets up the DOCKER-USER chain for the given [iptables.IPVersion].
@@ -41,7 +42,7 @@ func arrangeUserFilterRule() {
 // that are beyond the daemon's control.
 func setupUserChain(ipVersion iptables.IPVersion) error {
 	ipt := iptables.GetIptable(ipVersion)
-	if _, err := ipt.NewChain(userChain, iptables.Filter, false); err != nil {
+	if _, err := ipt.NewChain(userChain, iptables.Filter); err != nil {
 		return fmt.Errorf("failed to create %s %v chain: %v", userChain, ipVersion, err)
 	}
 	if err := ipt.AddReturnRule(userChain); err != nil {

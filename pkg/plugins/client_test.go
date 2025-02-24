@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -97,21 +96,18 @@ func TestBackoff(t *testing.T) {
 		retries    int
 		expTimeOff time.Duration
 	}{
-		{expTimeOff: time.Duration(1)},
-		{retries: 1, expTimeOff: time.Duration(2)},
-		{retries: 2, expTimeOff: time.Duration(4)},
-		{retries: 4, expTimeOff: time.Duration(16)},
-		{retries: 6, expTimeOff: time.Duration(30)},
-		{retries: 10, expTimeOff: time.Duration(30)},
+		{retries: 0, expTimeOff: 1 * time.Second},
+		{retries: 1, expTimeOff: 2 * time.Second},
+		{retries: 2, expTimeOff: 4 * time.Second},
+		{retries: 4, expTimeOff: 16 * time.Second},
+		{retries: 6, expTimeOff: 30 * time.Second},
+		{retries: 10, expTimeOff: 30 * time.Second},
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(fmt.Sprintf("retries: %v", tc.retries), func(t *testing.T) {
-			s := tc.expTimeOff * time.Second
-			if d := backoff(tc.retries); d != s {
-				t.Fatalf("Retry %v, expected %v, was %v\n", tc.retries, s, d)
-			}
+			d := backoff(tc.retries)
+			assert.Check(t, is.Equal(d, tc.expTimeOff))
 		})
 	}
 }
@@ -122,19 +118,17 @@ func TestAbortRetry(t *testing.T) {
 		timeOff  time.Duration
 		expAbort bool
 	}{
-		{timeOff: time.Duration(1)},
-		{timeOff: time.Duration(2)},
-		{timeOff: time.Duration(10)},
-		{timeOff: time.Duration(30), expAbort: true},
-		{timeOff: time.Duration(40), expAbort: true},
+		{timeOff: 1 * time.Second},
+		{timeOff: 2 * time.Second},
+		{timeOff: 10 * time.Second},
+		{timeOff: 30 * time.Second, expAbort: true},
+		{timeOff: 40 * time.Second, expAbort: true},
 	}
 
 	for _, tc := range cases {
-		tc := tc
 		t.Run(fmt.Sprintf("duration: %v", tc.timeOff), func(t *testing.T) {
-			s := tc.timeOff * time.Second
-			if a := abort(time.Now(), s, 0); a != tc.expAbort {
-				t.Fatalf("Duration %v, expected %v, was %v\n", tc.timeOff, s, a)
+			if a := abort(time.Now(), tc.timeOff, 0); a != tc.expAbort {
+				t.Fatalf("Duration %v, expected %v, was %v\n", tc.timeOff, tc.timeOff, a)
 			}
 		})
 	}
@@ -169,15 +163,21 @@ func TestNewClientWithTimeout(t *testing.T) {
 	m := Manifest{[]string{"VolumeDriver", "NetworkDriver"}}
 
 	mux.HandleFunc("/Test.Echo", func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 		io.Copy(w, r.Body)
 	})
 
 	timeout := 10 * time.Millisecond
 	c, _ := NewClientWithTimeout(addr, &tlsconfig.Options{InsecureSkipVerify: true}, timeout)
 	var output Manifest
-	err := c.CallWithOptions("Test.Echo", m, &output, func(opts *RequestOpts) { opts.testTimeOut = 1 })
-	assert.ErrorType(t, err, os.IsTimeout)
+
+	err := c.CallWithOptions("Test.Echo", m, &output, func(opts *RequestOpts) { opts.testTimeOut = 1 * time.Second })
+	var tErr interface {
+		Timeout() bool
+	}
+	if assert.Check(t, errors.As(err, &tErr), "want timeout error, got %T", err) {
+		assert.Check(t, tErr.Timeout())
+	}
 }
 
 func TestClientStream(t *testing.T) {

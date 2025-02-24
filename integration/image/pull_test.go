@@ -1,6 +1,7 @@
 package image
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,13 +11,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/platforms"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/platforms"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/testutil/daemon"
 	"github.com/docker/docker/testutil/registry"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
@@ -79,14 +81,14 @@ func createTestImage(ctx context.Context, t testing.TB, store content.Store) oci
 		Versioned: specs.Versioned{
 			SchemaVersion: 2,
 		},
-		MediaType: images.MediaTypeDockerSchema2Manifest,
+		MediaType: c8dimages.MediaTypeDockerSchema2Manifest,
 		Config: ocispec.Descriptor{
-			MediaType: images.MediaTypeDockerSchema2Config,
+			MediaType: c8dimages.MediaTypeDockerSchema2Config,
 			Digest:    configDigest,
 			Size:      int64(len(imgJSON)),
 		},
 		Layers: []ocispec.Descriptor{{
-			MediaType: images.MediaTypeDockerSchema2Layer,
+			MediaType: c8dimages.MediaTypeDockerSchema2Layer,
 			Digest:    layerDigest,
 			Size:      info.Size,
 		}},
@@ -106,7 +108,7 @@ func createTestImage(ctx context.Context, t testing.TB, store content.Store) oci
 	assert.Check(t, w.Close())
 
 	return ocispec.Descriptor{
-		MediaType: images.MediaTypeDockerSchema2Manifest,
+		MediaType: c8dimages.MediaTypeDockerSchema2Manifest,
 		Digest:    manifestDigest,
 		Size:      int64(len(manifestJSON)),
 	}
@@ -172,7 +174,6 @@ func TestImagePullNonExisting(t *testing.T) {
 		"library/asdfasdf",
 		"library/asdfasdf:latest",
 	} {
-		ref := ref
 		all := strings.Contains(ref, ":")
 		t.Run(ref, func(t *testing.T) {
 			t.Parallel()
@@ -194,4 +195,42 @@ func TestImagePullNonExisting(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestImagePullKeepOldAsDangling(t *testing.T) {
+	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows", "Can't run new daemons on Windows")
+
+	ctx := setupTest(t)
+
+	d := daemon.New(t)
+	d.StartWithBusybox(ctx, t)
+	defer d.Cleanup(t)
+
+	apiClient := d.NewClientT(t)
+
+	inspect1, err := apiClient.ImageInspect(ctx, "busybox:latest")
+	assert.NilError(t, err)
+
+	prevID := inspect1.ID
+
+	t.Log(inspect1)
+
+	assert.NilError(t, apiClient.ImageTag(ctx, "busybox:latest", "alpine:latest"))
+
+	_, err = apiClient.ImageRemove(ctx, "busybox:latest", image.RemoveOptions{})
+	assert.NilError(t, err)
+
+	rc, err := apiClient.ImagePull(ctx, "alpine:latest", image.PullOptions{})
+	assert.NilError(t, err)
+
+	defer rc.Close()
+
+	var b bytes.Buffer
+	_, _ = io.Copy(&b, rc)
+
+	t.Log(b.String())
+
+	_, err = apiClient.ImageInspect(ctx, prevID)
+	assert.NilError(t, err)
 }

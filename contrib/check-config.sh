@@ -128,27 +128,6 @@ check_device() {
 	fi
 }
 
-check_distro_userns() {
-	if [ ! -e /etc/os-release ]; then
-		return
-	fi
-	. /etc/os-release 2> /dev/null || /bin/true
-	case "$ID" in
-		centos | rhel)
-			case "$VERSION_ID" in
-				7*)
-					# this is a CentOS7 or RHEL7 system
-					grep -q 'user_namespace.enable=1' /proc/cmdline || {
-						# no user namespace support enabled
-						wrap_bad "  (RHEL7/CentOS7" "User namespaces disabled; add 'user_namespace.enable=1' to boot command line)"
-						EXITCODE=1
-					}
-					;;
-			esac
-			;;
-	esac
-}
-
 if [ ! -e "$CONFIG" ]; then
 	wrap_warning "warning: $CONFIG does not exist, searching other paths for kernel config ..."
 	for tryConfig in $possibleConfigs; do
@@ -231,7 +210,9 @@ check_flags \
 	NETFILTER_XT_MATCH_CONNTRACK \
 	NETFILTER_XT_MATCH_IPVS \
 	NETFILTER_XT_MARK \
+	NETFILTER_XT_SET \
 	IP_NF_NAT NF_NAT \
+	IP_SET IP_SET_HASH_NET \
 	POSIX_MQUEUE
 # (POSIX_MQUEUE is required for bind-mounting /dev/mqueue into containers)
 
@@ -256,7 +237,6 @@ echo
 echo 'Optional Features:'
 {
 	check_flags USER_NS
-	check_distro_userns
 }
 {
 	check_flags SECCOMP
