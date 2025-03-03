@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/containerd/log"
+	"github.com/docker/docker/libnetwork/drivers/bridge"
 	"github.com/docker/docker/libnetwork/iptables"
 	"github.com/docker/docker/libnetwork/ns"
 	"github.com/ishidawataru/sctp"
@@ -77,7 +78,7 @@ func findIfaceDstName(sb *Sandbox, ep *Endpoint) string {
 	return ""
 }
 
-// Add loadbalancer backend to the loadbalncer sandbox for the network.
+// Add loadbalancer backend to the loadbalancer sandbox for the network.
 // If needed add the service as well.
 func (n *Network) addLBBackend(ip net.IP, lb *loadBalancer) {
 	if len(lb.vip) == 0 {
@@ -122,7 +123,7 @@ func (n *Network) addLBBackend(ip net.IP, lb *loadBalancer) {
 
 		if sb.ingress {
 			var gwIP net.IP
-			if ep := sb.getGatewayEndpoint(); ep != nil {
+			if ep, _ := sb.getGatewayEndpoint(); ep != nil {
 				gwIP = ep.Iface().Address().IP
 			}
 			if err := programIngress(gwIP, lb.service.ingressPorts, false); err != nil {
@@ -223,8 +224,8 @@ func (n *Network) rmLBBackend(ip net.IP, lb *loadBalancer, rmService bool, fullR
 
 		if sb.ingress {
 			var gwIP net.IP
-			if ep := sb.getGatewayEndpoint(); ep != nil {
-				gwIP = ep.Iface().Address().IP
+			if gwEP, _ := sb.getGatewayEndpoint(); gwEP != nil {
+				gwIP = gwEP.Iface().Address().IP
 			}
 			if err := programIngress(gwIP, lb.service.ingressPorts, true); err != nil {
 				log.G(context.TODO()).Errorf("Failed to delete ingress: %v", err)
@@ -359,11 +360,22 @@ func programIngress(gwIP net.IP, ingressPorts []*PortConfig, isDelete bool) erro
 			}
 		}
 
-		if !iptable.Exists(iptables.Filter, "FORWARD", "-j", ingressChain) {
-			if err := iptable.RawCombinedOutput("-I", "FORWARD", "-j", ingressChain); err != nil {
-				return fmt.Errorf("failed to add jump rule to %s in filter table forward chain: %v", ingressChain, err)
+		// The DOCKER-FORWARD chain is created by the bridge driver on startup. It's a stable place to
+		// put the jump to DOCKER-INGRESS (nothing else will ever be inserted before it, and the jump
+		// will precede the bridge driver's other rules).
+		if !iptable.Exists(iptables.Filter, bridge.DockerForwardChain, "-j", ingressChain) {
+			if err := iptable.RawCombinedOutput("-I", bridge.DockerForwardChain, "-j", ingressChain); err != nil {
+				return fmt.Errorf("failed to add jump rule to %s in filter table %s chain: %v",
+					ingressChain, bridge.DockerForwardChain, err)
 			}
-			arrangeUserFilterRule()
+		}
+		// Remove the jump from FORWARD to DOCKER-INGRESS, if it was created there by a version of
+		// the daemon older than 28.0.1.
+		// FIXME(robmry) - should only do this once, on startup.
+		if iptable.Exists(iptables.Filter, "FORWARD", "-j", ingressChain) {
+			if err := iptable.RawCombinedOutput("-D", "FORWARD", "-j", ingressChain); err != nil {
+				log.G(context.TODO()).WithError(err).Debug("Failed to delete jump from FORWARD to " + ingressChain)
+			}
 		}
 
 		oifName, err := findOIFName(gwIP)
@@ -450,26 +462,6 @@ func programIngress(gwIP net.IP, ingressPorts []*PortConfig, isDelete bool) erro
 	}
 
 	return nil
-}
-
-// In the filter table FORWARD chain the first rule should be to jump to
-// DOCKER-USER so the user is able to filter packet first.
-// The second rule should be jump to INGRESS-CHAIN.
-// This chain has the rules to allow access to the published ports for swarm tasks
-// from local bridge networks and docker_gwbridge (ie:taks on other swarm networks)
-func arrangeIngressFilterRule() {
-	// TODO IPv6 support
-	iptable := iptables.GetIptable(iptables.IPv4)
-	if iptable.ExistChain(ingressChain, iptables.Filter) {
-		if iptable.Exists(iptables.Filter, "FORWARD", "-j", ingressChain) {
-			if err := iptable.RawCombinedOutput("-D", "FORWARD", "-j", ingressChain); err != nil {
-				log.G(context.TODO()).Warnf("failed to delete jump rule to ingressChain in filter table: %v", err)
-			}
-		}
-		if err := iptable.RawCombinedOutput("-I", "FORWARD", "-j", ingressChain); err != nil {
-			log.G(context.TODO()).Warnf("failed to add jump rule to ingressChain in filter table: %v", err)
-		}
-	}
 }
 
 func findOIFName(ip net.IP) (string, error) {

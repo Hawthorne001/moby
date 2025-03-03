@@ -2,7 +2,6 @@ package environment // import "github.com/docker/docker/testutil/environment"
 
 import (
 	"context"
-	"regexp"
 	"strings"
 	"testing"
 
@@ -14,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/internal/lazyregexp"
 	"go.opentelemetry.io/otel"
 	"gotest.tools/v3/assert"
 )
@@ -30,7 +30,7 @@ func (e *Execution) Clean(ctx context.Context, t testing.TB) {
 	apiClient := e.APIClient()
 
 	platform := e.DaemonInfo.OSType
-	if (platform != "windows") || (platform == "windows" && e.DaemonInfo.Isolation == "hyperv") {
+	if platform != "windows" || e.DaemonInfo.Isolation == "hyperv" {
 		unpauseAllContainers(ctx, t, apiClient)
 	}
 	deleteAllContainers(ctx, t, apiClient, e.protectedElements.containers)
@@ -53,7 +53,7 @@ func unpauseAllContainers(ctx context.Context, t testing.TB, client client.Conta
 	}
 }
 
-func getPausedContainers(ctx context.Context, t testing.TB, client client.ContainerAPIClient) []types.Container {
+func getPausedContainers(ctx context.Context, t testing.TB, client client.ContainerAPIClient) []container.Summary {
 	t.Helper()
 	containers, err := client.ContainerList(ctx, container.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("status", "paused")),
@@ -63,7 +63,8 @@ func getPausedContainers(ctx context.Context, t testing.TB, client client.Contai
 	return containers
 }
 
-var alreadyExists = regexp.MustCompile(`Error response from daemon: removal of container (\w+) is already in progress`)
+// FIXME(thaJeztah): can we rewrite this check to not do string-matching, and instead detect error-type?
+var alreadyExists = lazyregexp.New(`Error response from daemon: removal of container (\w+) is already in progress`)
 
 func deleteAllContainers(ctx context.Context, t testing.TB, apiclient client.ContainerAPIClient, protectedContainers map[string]struct{}) {
 	t.Helper()
@@ -87,7 +88,7 @@ func deleteAllContainers(ctx context.Context, t testing.TB, apiclient client.Con
 	}
 }
 
-func getAllContainers(ctx context.Context, t testing.TB, client client.ContainerAPIClient) []types.Container {
+func getAllContainers(ctx context.Context, t testing.TB, client client.ContainerAPIClient) []container.Summary {
 	t.Helper()
 	containers, err := client.ContainerList(ctx, container.ListOptions{
 		All: true,
@@ -149,7 +150,7 @@ func deleteAllVolumes(ctx context.Context, t testing.TB, c client.VolumeAPIClien
 
 func deleteAllNetworks(ctx context.Context, t testing.TB, c client.NetworkAPIClient, daemonPlatform string, protectedNetworks map[string]struct{}) {
 	t.Helper()
-	networks, err := c.NetworkList(ctx, types.NetworkListOptions{})
+	networks, err := c.NetworkList(ctx, network.ListOptions{})
 	assert.Check(t, err, "failed to list networks")
 
 	for _, n := range networks {

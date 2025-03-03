@@ -65,7 +65,7 @@ func testVolWithQuota(t *testing.T, mountPoint, backingFsDev, testDir string) {
 	assert.NilError(t, os.WriteFile(testfile, make([]byte, quotaSize/2), 0o644))
 	assert.NilError(t, os.Remove(testfile))
 
-	// test writing fiel larger than quota
+	// test writing file larger than quota
 	err = os.WriteFile(testfile, make([]byte, quotaSize+1), 0o644)
 	assert.ErrorContains(t, err, "")
 	if _, err := os.Stat(testfile); err == nil {
@@ -229,7 +229,6 @@ func TestVolCreateValidation(t *testing.T) {
 	}
 
 	for i, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			if tc.name == "" {
 				tc.name = "vol-" + strconv.Itoa(i)
@@ -313,7 +312,6 @@ func TestVolMountOpts(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			dev, opts, err := getMountOptions(&tc.opts, resolveIP)
 

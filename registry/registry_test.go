@@ -1,6 +1,8 @@
 package registry // import "github.com/docker/docker/registry"
 
 import (
+	"errors"
+	"net"
 	"testing"
 
 	"github.com/distribution/reference"
@@ -9,13 +11,35 @@ import (
 	is "gotest.tools/v3/assert/cmp"
 )
 
+// overrideLookupIP overrides net.LookupIP for testing.
+func overrideLookupIP(t *testing.T) {
+	t.Helper()
+	restoreLookup := lookupIP
+
+	// override net.LookupIP
+	lookupIP = func(host string) ([]net.IP, error) {
+		mockHosts := map[string][]net.IP{
+			"":            {net.ParseIP("0.0.0.0")},
+			"localhost":   {net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+			"example.com": {net.ParseIP("42.42.42.42")},
+			"other.com":   {net.ParseIP("43.43.43.43")},
+		}
+		if addrs, ok := mockHosts[host]; ok {
+			return addrs, nil
+		}
+		return nil, errors.New("lookup: no such host")
+	}
+	t.Cleanup(func() {
+		lookupIP = restoreLookup
+	})
+}
+
 func TestParseRepositoryInfo(t *testing.T) {
 	type staticRepositoryInfo struct {
 		Index         *registry.IndexInfo
 		RemoteName    string
 		CanonicalName string
 		LocalName     string
-		Official      bool
 	}
 
 	expectedRepoInfos := map[string]staticRepositoryInfo{
@@ -27,7 +51,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "fooo/bar",
 			LocalName:     "fooo/bar",
 			CanonicalName: "docker.io/fooo/bar",
-			Official:      false,
 		},
 		"library/ubuntu": {
 			Index: &registry.IndexInfo{
@@ -37,7 +60,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "library/ubuntu",
 			LocalName:     "ubuntu",
 			CanonicalName: "docker.io/library/ubuntu",
-			Official:      true,
 		},
 		"nonlibrary/ubuntu": {
 			Index: &registry.IndexInfo{
@@ -47,7 +69,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "nonlibrary/ubuntu",
 			LocalName:     "nonlibrary/ubuntu",
 			CanonicalName: "docker.io/nonlibrary/ubuntu",
-			Official:      false,
 		},
 		"ubuntu": {
 			Index: &registry.IndexInfo{
@@ -57,7 +78,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "library/ubuntu",
 			LocalName:     "ubuntu",
 			CanonicalName: "docker.io/library/ubuntu",
-			Official:      true,
 		},
 		"other/library": {
 			Index: &registry.IndexInfo{
@@ -67,7 +87,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "other/library",
 			LocalName:     "other/library",
 			CanonicalName: "docker.io/other/library",
-			Official:      false,
 		},
 		"127.0.0.1:8000/private/moonbase": {
 			Index: &registry.IndexInfo{
@@ -77,7 +96,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "private/moonbase",
 			LocalName:     "127.0.0.1:8000/private/moonbase",
 			CanonicalName: "127.0.0.1:8000/private/moonbase",
-			Official:      false,
 		},
 		"127.0.0.1:8000/privatebase": {
 			Index: &registry.IndexInfo{
@@ -87,7 +105,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "privatebase",
 			LocalName:     "127.0.0.1:8000/privatebase",
 			CanonicalName: "127.0.0.1:8000/privatebase",
-			Official:      false,
 		},
 		"localhost:8000/private/moonbase": {
 			Index: &registry.IndexInfo{
@@ -97,7 +114,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "private/moonbase",
 			LocalName:     "localhost:8000/private/moonbase",
 			CanonicalName: "localhost:8000/private/moonbase",
-			Official:      false,
 		},
 		"localhost:8000/privatebase": {
 			Index: &registry.IndexInfo{
@@ -107,7 +123,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "privatebase",
 			LocalName:     "localhost:8000/privatebase",
 			CanonicalName: "localhost:8000/privatebase",
-			Official:      false,
 		},
 		"example.com/private/moonbase": {
 			Index: &registry.IndexInfo{
@@ -117,7 +132,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "private/moonbase",
 			LocalName:     "example.com/private/moonbase",
 			CanonicalName: "example.com/private/moonbase",
-			Official:      false,
 		},
 		"example.com/privatebase": {
 			Index: &registry.IndexInfo{
@@ -127,7 +141,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "privatebase",
 			LocalName:     "example.com/privatebase",
 			CanonicalName: "example.com/privatebase",
-			Official:      false,
 		},
 		"example.com:8000/private/moonbase": {
 			Index: &registry.IndexInfo{
@@ -137,7 +150,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "private/moonbase",
 			LocalName:     "example.com:8000/private/moonbase",
 			CanonicalName: "example.com:8000/private/moonbase",
-			Official:      false,
 		},
 		"example.com:8000/privatebase": {
 			Index: &registry.IndexInfo{
@@ -147,7 +159,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "privatebase",
 			LocalName:     "example.com:8000/privatebase",
 			CanonicalName: "example.com:8000/privatebase",
-			Official:      false,
 		},
 		"localhost/private/moonbase": {
 			Index: &registry.IndexInfo{
@@ -157,7 +168,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "private/moonbase",
 			LocalName:     "localhost/private/moonbase",
 			CanonicalName: "localhost/private/moonbase",
-			Official:      false,
 		},
 		"localhost/privatebase": {
 			Index: &registry.IndexInfo{
@@ -167,7 +177,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "privatebase",
 			LocalName:     "localhost/privatebase",
 			CanonicalName: "localhost/privatebase",
-			Official:      false,
 		},
 		IndexName + "/public/moonbase": {
 			Index: &registry.IndexInfo{
@@ -177,7 +186,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "public/moonbase",
 			LocalName:     "public/moonbase",
 			CanonicalName: "docker.io/public/moonbase",
-			Official:      false,
 		},
 		"index." + IndexName + "/public/moonbase": {
 			Index: &registry.IndexInfo{
@@ -187,7 +195,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "public/moonbase",
 			LocalName:     "public/moonbase",
 			CanonicalName: "docker.io/public/moonbase",
-			Official:      false,
 		},
 		"ubuntu-12.04-base": {
 			Index: &registry.IndexInfo{
@@ -197,7 +204,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "library/ubuntu-12.04-base",
 			LocalName:     "ubuntu-12.04-base",
 			CanonicalName: "docker.io/library/ubuntu-12.04-base",
-			Official:      true,
 		},
 		IndexName + "/ubuntu-12.04-base": {
 			Index: &registry.IndexInfo{
@@ -207,7 +213,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "library/ubuntu-12.04-base",
 			LocalName:     "ubuntu-12.04-base",
 			CanonicalName: "docker.io/library/ubuntu-12.04-base",
-			Official:      true,
 		},
 		"index." + IndexName + "/ubuntu-12.04-base": {
 			Index: &registry.IndexInfo{
@@ -217,7 +222,6 @@ func TestParseRepositoryInfo(t *testing.T) {
 			RemoteName:    "library/ubuntu-12.04-base",
 			LocalName:     "ubuntu-12.04-base",
 			CanonicalName: "docker.io/library/ubuntu-12.04-base",
-			Official:      true,
 		},
 	}
 
@@ -236,23 +240,19 @@ func TestParseRepositoryInfo(t *testing.T) {
 			assert.Check(t, is.Equal(reference.FamiliarName(repoInfo.Name), expectedRepoInfo.LocalName), reposName)
 			assert.Check(t, is.Equal(repoInfo.Name.Name(), expectedRepoInfo.CanonicalName), reposName)
 			assert.Check(t, is.Equal(repoInfo.Index.Official, expectedRepoInfo.Index.Official), reposName)
-			assert.Check(t, is.Equal(repoInfo.Official, expectedRepoInfo.Official), reposName)
 		}
 	}
 }
 
 func TestNewIndexInfo(t *testing.T) {
+	overrideLookupIP(t)
 	testIndexInfo := func(config *serviceConfig, expectedIndexInfos map[string]*registry.IndexInfo) {
 		for indexName, expectedIndexInfo := range expectedIndexInfos {
-			index, err := newIndexInfo(config, indexName)
-			if err != nil {
-				t.Fatal(err)
-			} else {
-				assert.Check(t, is.Equal(index.Name, expectedIndexInfo.Name), indexName+" name")
-				assert.Check(t, is.Equal(index.Official, expectedIndexInfo.Official), indexName+" is official")
-				assert.Check(t, is.Equal(index.Secure, expectedIndexInfo.Secure), indexName+" is secure")
-				assert.Check(t, is.Equal(len(index.Mirrors), len(expectedIndexInfo.Mirrors)), indexName+" mirrors")
-			}
+			index := newIndexInfo(config, indexName)
+			assert.Check(t, is.Equal(index.Name, expectedIndexInfo.Name), indexName+" name")
+			assert.Check(t, is.Equal(index.Official, expectedIndexInfo.Official), indexName+" is official")
+			assert.Check(t, is.Equal(index.Secure, expectedIndexInfo.Secure), indexName+" is secure")
+			assert.Check(t, is.Equal(len(index.Mirrors), len(expectedIndexInfo.Mirrors)), indexName+" mirrors")
 		}
 	}
 
@@ -414,52 +414,8 @@ func TestMirrorEndpointLookup(t *testing.T) {
 	}
 }
 
-func TestAllowNondistributableArtifacts(t *testing.T) {
-	tests := []struct {
-		addr       string
-		registries []string
-		expected   bool
-	}{
-		{IndexName, nil, false},
-		{"example.com", []string{}, false},
-		{"example.com", []string{"example.com"}, true},
-		{"localhost", []string{"localhost:5000"}, false},
-		{"localhost:5000", []string{"localhost:5000"}, true},
-		{"localhost", []string{"example.com"}, false},
-		{"127.0.0.1:5000", []string{"127.0.0.1:5000"}, true},
-		{"localhost", nil, false},
-		{"localhost:5000", nil, false},
-		{"127.0.0.1", nil, false},
-		{"localhost", []string{"example.com"}, false},
-		{"127.0.0.1", []string{"example.com"}, false},
-		{"example.com", nil, false},
-		{"example.com", []string{"example.com"}, true},
-		{"127.0.0.1", []string{"example.com"}, false},
-		{"127.0.0.1:5000", []string{"example.com"}, false},
-		{"example.com:5000", []string{"42.42.0.0/16"}, true},
-		{"example.com", []string{"42.42.0.0/16"}, true},
-		{"example.com:5000", []string{"42.42.42.42/8"}, true},
-		{"127.0.0.1:5000", []string{"127.0.0.0/8"}, true},
-		{"42.42.42.42:5000", []string{"42.1.1.1/8"}, true},
-		{"invalid.example.com", []string{"42.42.0.0/16"}, false},
-		{"invalid.example.com", []string{"invalid.example.com"}, true},
-		{"invalid.example.com:5000", []string{"invalid.example.com"}, false},
-		{"invalid.example.com:5000", []string{"invalid.example.com:5000"}, true},
-	}
-	for _, tt := range tests {
-		config, err := newServiceConfig(ServiceOptions{
-			AllowNondistributableArtifacts: tt.registries,
-		})
-		if err != nil {
-			t.Error(err)
-		}
-		if v := config.allowNondistributableArtifacts(tt.addr); v != tt.expected {
-			t.Errorf("allowNondistributableArtifacts failed for %q %v, expected %v got %v", tt.addr, tt.registries, tt.expected, v)
-		}
-	}
-}
-
 func TestIsSecureIndex(t *testing.T) {
+	overrideLookupIP(t)
 	tests := []struct {
 		addr               string
 		insecureRegistries []string

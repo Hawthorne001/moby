@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/docker/docker/api/types"
+	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/integration/internal/container"
@@ -18,17 +19,13 @@ import (
 func TestDiskUsage(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows") // d.Start fails on Windows with `protocol not available`
 
-	// TODO: If this helps, then fix the root cause.
-	// See: https://github.com/moby/moby/issues/47119
-	// t.Parallel()
-
 	ctx := testutil.StartSpan(baseContext, t)
 
 	d := daemon.New(t)
 	defer d.Cleanup(t)
-	d.Start(t, "--iptables=false")
+	d.Start(t, "--iptables=false", "--ip6tables=false")
 	defer d.Stop(t)
-	client := d.NewClientT(t)
+	apiClient := d.NewClientT(t)
 
 	var stepDU types.DiskUsage
 	for _, step := range []struct {
@@ -38,11 +35,22 @@ func TestDiskUsage(t *testing.T) {
 		{
 			doc: "empty",
 			next: func(t *testing.T, _ types.DiskUsage) types.DiskUsage {
-				du, err := client.DiskUsage(ctx, types.DiskUsageOptions{})
+				du, err := apiClient.DiskUsage(ctx, types.DiskUsageOptions{})
 				assert.NilError(t, err)
+
+				expectedLayersSize := int64(0)
+				// TODO: Investigate https://github.com/moby/moby/issues/47119
+				// Make 4096 (block size) also a valid value for zero usage.
+				if testEnv.UsingSnapshotter() && testEnv.IsRootless() {
+					if du.LayersSize == 4096 {
+						expectedLayersSize = du.LayersSize
+					}
+				}
+
 				assert.DeepEqual(t, du, types.DiskUsage{
+					LayersSize: expectedLayersSize,
 					Images:     []*image.Summary{},
-					Containers: []*types.Container{},
+					Containers: []*containertypes.Summary{},
 					Volumes:    []*volume.Volume{},
 					BuildCache: []*types.BuildCache{},
 				})
@@ -54,7 +62,7 @@ func TestDiskUsage(t *testing.T) {
 			next: func(t *testing.T, _ types.DiskUsage) types.DiskUsage {
 				d.LoadBusybox(ctx, t)
 
-				du, err := client.DiskUsage(ctx, types.DiskUsageOptions{})
+				du, err := apiClient.DiskUsage(ctx, types.DiskUsageOptions{})
 				assert.NilError(t, err)
 				assert.Assert(t, du.LayersSize > 0)
 				assert.Equal(t, len(du.Images), 1)
@@ -76,9 +84,9 @@ func TestDiskUsage(t *testing.T) {
 		{
 			doc: "after container.Run",
 			next: func(t *testing.T, prev types.DiskUsage) types.DiskUsage {
-				cID := container.Run(ctx, t, client)
+				cID := container.Run(ctx, t, apiClient)
 
-				du, err := client.DiskUsage(ctx, types.DiskUsageOptions{})
+				du, err := apiClient.DiskUsage(ctx, types.DiskUsageOptions{})
 				assert.NilError(t, err)
 				assert.Equal(t, len(du.Containers), 1)
 				assert.Equal(t, len(du.Containers[0].Names), 1)
@@ -98,6 +106,9 @@ func TestDiskUsage(t *testing.T) {
 				// The rootfs size should be equivalent to all the layers,
 				// previously used prev.Images[0].Size, which may differ from content data
 				assert.Check(t, is.Equal(du.Containers[0].SizeRootFs, du.LayersSize))
+
+				// ImageManifestDescriptor should NOT be populated.
+				assert.Check(t, is.Nil(du.Containers[0].ImageManifestDescriptor))
 
 				return du
 			},
@@ -250,12 +261,11 @@ func TestDiskUsage(t *testing.T) {
 					},
 				},
 			} {
-				tc := tc
 				t.Run(tc.doc, func(t *testing.T) {
 					ctx := testutil.StartSpan(ctx, t)
 					// TODO: Run in parallel once https://github.com/moby/moby/pull/42560 is merged.
 
-					du, err := client.DiskUsage(ctx, tc.options)
+					du, err := apiClient.DiskUsage(ctx, tc.options)
 					assert.NilError(t, err)
 					assert.DeepEqual(t, du, tc.expected)
 				})

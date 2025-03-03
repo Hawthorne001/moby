@@ -4,20 +4,21 @@ import (
 	"context"
 	"net"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/containerd/log"
 	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/registry"
+	"github.com/docker/docker/internal/lazyregexp"
 )
 
 // ServiceOptions holds command line options.
 type ServiceOptions struct {
-	AllowNondistributableArtifacts []string `json:"allow-nondistributable-artifacts,omitempty"`
-	Mirrors                        []string `json:"registry-mirrors,omitempty"`
-	InsecureRegistries             []string `json:"insecure-registries,omitempty"`
+	AllowNondistributableArtifacts []string `json:"allow-nondistributable-artifacts,omitempty"` // Deprecated: non-distributable artifacts are deprecated and enabled by default. This field will be removed in the next release.
+
+	Mirrors            []string `json:"registry-mirrors,omitempty"`
+	InsecureRegistries []string `json:"insecure-registries,omitempty"`
 }
 
 // serviceConfig holds daemon configuration for the registry service.
@@ -55,11 +56,38 @@ var (
 		Host:   DefaultRegistryHost,
 	}
 
-	emptyServiceConfig, _ = newServiceConfig(ServiceOptions{})
-	validHostPortRegex    = regexp.MustCompile(`^` + reference.DomainRegexp.String() + `$`)
+	// ipv6Loopback is the CIDR for the IPv6 loopback address ("::1"); "::1/128"
+	ipv6Loopback = &net.IPNet{
+		IP:   net.IPv6loopback,
+		Mask: net.CIDRMask(128, 128),
+	}
 
-	// for mocking in unit tests
-	lookupIP = net.LookupIP
+	// ipv4Loopback is the CIDR for IPv4 loopback addresses ("127.0.0.0/8")
+	ipv4Loopback = &net.IPNet{
+		IP:   net.IPv4(127, 0, 0, 0),
+		Mask: net.CIDRMask(8, 32),
+	}
+
+	// emptyServiceConfig is a default service-config for situations where
+	// no config-file is available (e.g. when used in the CLI). If won't
+	// have mirrors configured, but does have the default insecure registry
+	// CIDRs for loopback interfaces configured.
+	emptyServiceConfig = &serviceConfig{
+		IndexConfigs: map[string]*registry.IndexInfo{
+			IndexName: {
+				Name:     IndexName,
+				Mirrors:  make([]string, 0),
+				Secure:   true,
+				Official: true,
+			},
+		},
+		InsecureRegistryCIDRs: []*registry.NetIPNet{
+			(*registry.NetIPNet)(ipv6Loopback),
+			(*registry.NetIPNet)(ipv4Loopback),
+		},
+	}
+
+	validHostPortRegex = lazyregexp.New(`^` + reference.DomainRegexp.String() + `$`)
 
 	// certsDir is used to override defaultCertsDir.
 	certsDir string
@@ -83,9 +111,6 @@ func CertsDir() string {
 // newServiceConfig returns a new instance of ServiceConfig
 func newServiceConfig(options ServiceOptions) (*serviceConfig, error) {
 	config := &serviceConfig{}
-	if err := config.loadAllowNondistributableArtifacts(options.AllowNondistributableArtifacts); err != nil {
-		return nil, err
-	}
 	if err := config.loadMirrors(options.Mirrors); err != nil {
 		return nil, err
 	}
@@ -103,49 +128,10 @@ func (config *serviceConfig) copy() *registry.ServiceConfig {
 		ic[key] = value
 	}
 	return &registry.ServiceConfig{
-		AllowNondistributableArtifactsCIDRs:     append([]*registry.NetIPNet(nil), config.AllowNondistributableArtifactsCIDRs...),
-		AllowNondistributableArtifactsHostnames: append([]string(nil), config.AllowNondistributableArtifactsHostnames...),
-		InsecureRegistryCIDRs:                   append([]*registry.NetIPNet(nil), config.InsecureRegistryCIDRs...),
-		IndexConfigs:                            ic,
-		Mirrors:                                 append([]string(nil), config.Mirrors...),
+		InsecureRegistryCIDRs: append([]*registry.NetIPNet(nil), config.InsecureRegistryCIDRs...),
+		IndexConfigs:          ic,
+		Mirrors:               append([]string(nil), config.Mirrors...),
 	}
-}
-
-// loadAllowNondistributableArtifacts loads allow-nondistributable-artifacts registries into config.
-func (config *serviceConfig) loadAllowNondistributableArtifacts(registries []string) error {
-	cidrs := map[string]*registry.NetIPNet{}
-	hostnames := map[string]bool{}
-
-	for _, r := range registries {
-		if _, err := ValidateIndexName(r); err != nil {
-			return err
-		}
-		if hasScheme(r) {
-			return invalidParamf("allow-nondistributable-artifacts registry %s should not contain '://'", r)
-		}
-
-		if _, ipnet, err := net.ParseCIDR(r); err == nil {
-			// Valid CIDR.
-			cidrs[ipnet.String()] = (*registry.NetIPNet)(ipnet)
-		} else if err = validateHostPort(r); err == nil {
-			// Must be `host:port` if not CIDR.
-			hostnames[r] = true
-		} else {
-			return invalidParamWrapf(err, "allow-nondistributable-artifacts registry %s is not valid", r)
-		}
-	}
-
-	config.AllowNondistributableArtifactsCIDRs = make([]*registry.NetIPNet, 0, len(cidrs))
-	for _, c := range cidrs {
-		config.AllowNondistributableArtifactsCIDRs = append(config.AllowNondistributableArtifactsCIDRs, c)
-	}
-
-	config.AllowNondistributableArtifactsHostnames = make([]string, 0, len(hostnames))
-	for h := range hostnames {
-		config.AllowNondistributableArtifactsHostnames = append(config.AllowNondistributableArtifactsHostnames, h)
-	}
-
-	return nil
 }
 
 // loadMirrors loads mirrors to config, after removing duplicates.
@@ -184,7 +170,7 @@ func (config *serviceConfig) loadMirrors(mirrors []string) error {
 func (config *serviceConfig) loadInsecureRegistries(registries []string) error {
 	// Localhost is by default considered as an insecure registry. This is a
 	// stop-gap for people who are running a private registry on localhost.
-	registries = append(registries, "127.0.0.0/8")
+	registries = append(registries, "::1/128", "127.0.0.0/8")
 
 	var (
 		insecureRegistryCIDRs = make([]*registry.NetIPNet, 0)
@@ -245,25 +231,6 @@ skip:
 	return nil
 }
 
-// allowNondistributableArtifacts returns true if the provided hostname is part of the list of registries
-// that allow push of nondistributable artifacts.
-//
-// The list can contain elements with CIDR notation to specify a whole subnet. If the subnet contains an IP
-// of the registry specified by hostname, true is returned.
-//
-// hostname should be a URL.Host (`host:port` or `host`) where the `host` part can be either a domain name
-// or an IP address. If it is a domain name, then it will be resolved to IP addresses for matching. If
-// resolution fails, CIDR matching is not performed.
-func (config *serviceConfig) allowNondistributableArtifacts(hostname string) bool {
-	for _, h := range config.AllowNondistributableArtifactsHostnames {
-		if h == hostname {
-			return true
-		}
-	}
-
-	return isCIDRMatch(config.AllowNondistributableArtifactsCIDRs, hostname)
-}
-
 // isSecureIndex returns false if the provided indexName is part of the list of insecure registries
 // Insecure registries accept HTTP and/or accept HTTPS with certificates from unknown CAs.
 //
@@ -285,30 +252,37 @@ func (config *serviceConfig) isSecureIndex(indexName string) bool {
 	return !isCIDRMatch(config.InsecureRegistryCIDRs, indexName)
 }
 
+// for mocking in unit tests.
+var lookupIP = net.LookupIP
+
 // isCIDRMatch returns true if URLHost matches an element of cidrs. URLHost is a URL.Host (`host:port` or `host`)
 // where the `host` part can be either a domain name or an IP address. If it is a domain name, then it will be
 // resolved to IP addresses for matching. If resolution fails, false is returned.
 func isCIDRMatch(cidrs []*registry.NetIPNet, URLHost string) bool {
+	if len(cidrs) == 0 {
+		return false
+	}
+
 	host, _, err := net.SplitHostPort(URLHost)
 	if err != nil {
-		// Assume URLHost is of the form `host` without the port and go on.
+		// Assume URLHost is a host without port and go on.
 		host = URLHost
 	}
 
-	addrs, err := lookupIP(host)
-	if err != nil {
-		ip := net.ParseIP(host)
-		if ip != nil {
-			addrs = []net.IP{ip}
+	var addresses []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		// Host is an IP-address.
+		addresses = append(addresses, ip)
+	} else {
+		// Try to resolve the host's IP-address.
+		addresses, err = lookupIP(host)
+		if err != nil {
+			// We failed to resolve the host; assume there's no match.
+			return false
 		}
-
-		// if ip == nil, then `host` is neither an IP nor it could be looked up,
-		// either because the index is unreachable, or because the index is behind an HTTP proxy.
-		// So, len(addrs) == 0 and we're not aborting.
 	}
 
-	// Try CIDR notation only if addrs has any elements, i.e. if `host`'s IP could be determined.
-	for _, addr := range addrs {
+	for _, addr := range addresses {
 		for _, ipnet := range cidrs {
 			// check if the addr falls in the subnet
 			if (*net.IPNet)(ipnet).Contains(addr) {
@@ -344,14 +318,20 @@ func ValidateMirror(val string) (string, error) {
 // ValidateIndexName validates an index name. It is used by the daemon to
 // validate the daemon configuration.
 func ValidateIndexName(val string) (string, error) {
-	// TODO: upstream this to check to reference package
-	if val == "index.docker.io" {
-		val = "docker.io"
-	}
+	val = normalizeIndexName(val)
 	if strings.HasPrefix(val, "-") || strings.HasSuffix(val, "-") {
 		return "", invalidParamf("invalid index name (%s). Cannot begin or end with a hyphen", val)
 	}
 	return val, nil
+}
+
+func normalizeIndexName(val string) string {
+	// TODO(thaJeztah): consider normalizing other known options, such as "(https://)registry-1.docker.io", "https://index.docker.io/v1/".
+	// TODO: upstream this to check to reference package
+	if val == "index.docker.io" {
+		return "docker.io"
+	}
+	return val
 }
 
 func hasScheme(reposName string) bool {
@@ -359,7 +339,7 @@ func hasScheme(reposName string) bool {
 }
 
 func validateHostPort(s string) error {
-	// Split host and port, and in case s can not be splitted, assume host only
+	// Split host and port, and in case s can not be split, assume host only
 	host, port, err := net.SplitHostPort(s)
 	if err != nil {
 		host = s
@@ -383,25 +363,20 @@ func validateHostPort(s string) error {
 }
 
 // newIndexInfo returns IndexInfo configuration from indexName
-func newIndexInfo(config *serviceConfig, indexName string) (*registry.IndexInfo, error) {
-	var err error
-	indexName, err = ValidateIndexName(indexName)
-	if err != nil {
-		return nil, err
-	}
+func newIndexInfo(config *serviceConfig, indexName string) *registry.IndexInfo {
+	indexName = normalizeIndexName(indexName)
 
 	// Return any configured index info, first.
 	if index, ok := config.IndexConfigs[indexName]; ok {
-		return index, nil
+		return index
 	}
 
 	// Construct a non-configured index info.
 	return &registry.IndexInfo{
-		Name:     indexName,
-		Mirrors:  make([]string, 0),
-		Secure:   config.isSecureIndex(indexName),
-		Official: false,
-	}, nil
+		Name:    indexName,
+		Mirrors: make([]string, 0),
+		Secure:  config.isSecureIndex(indexName),
+	}
 }
 
 // GetAuthConfigKey special-cases using the full index address of the official
@@ -414,18 +389,22 @@ func GetAuthConfigKey(index *registry.IndexInfo) string {
 }
 
 // newRepositoryInfo validates and breaks down a repository name into a RepositoryInfo
-func newRepositoryInfo(config *serviceConfig, name reference.Named) (*RepositoryInfo, error) {
-	index, err := newIndexInfo(config, reference.Domain(name))
-	if err != nil {
-		return nil, err
+func newRepositoryInfo(config *serviceConfig, name reference.Named) *RepositoryInfo {
+	index := newIndexInfo(config, reference.Domain(name))
+	var officialRepo bool
+	if index.Official {
+		// RepositoryInfo.Official indicates whether the image repository
+		// is an official (docker library official images) repository.
+		//
+		// We only need to check this if the image-repository is on Docker Hub.
+		officialRepo = !strings.ContainsRune(reference.FamiliarName(name), '/')
 	}
-	official := !strings.ContainsRune(reference.FamiliarName(name), '/')
 
 	return &RepositoryInfo{
 		Name:     reference.TrimNamed(name),
 		Index:    index,
-		Official: official,
-	}, nil
+		Official: officialRepo,
+	}
 }
 
 // ParseRepositoryInfo performs the breakdown of a repository name into a
@@ -433,5 +412,5 @@ func newRepositoryInfo(config *serviceConfig, name reference.Named) (*Repository
 //
 // It is used by the Docker cli to interact with registry-related endpoints.
 func ParseRepositoryInfo(reposName reference.Named) (*RepositoryInfo, error) {
-	return newRepositoryInfo(emptyServiceConfig, reposName)
+	return newRepositoryInfo(emptyServiceConfig, reposName), nil
 }

@@ -4,6 +4,7 @@ package libnetwork
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"net/netip"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/docker/docker/libnetwork/internal/resolvconf"
 	"github.com/docker/docker/libnetwork/types"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
 )
 
 const (
@@ -26,17 +28,30 @@ const (
 	resolverIPSandbox = "127.0.0.11"
 )
 
-// finishInitDNS is to be called after the container namespace has been created,
-// before it the user process is started. The container's support for IPv6 can be
-// determined at this point.
-func (sb *Sandbox) finishInitDNS() error {
-	if err := sb.buildHostsFile(); err != nil {
-		return errdefs.System(err)
-	}
+// AddHostsEntry adds an entry to /etc/hosts.
+func (sb *Sandbox) AddHostsEntry(ctx context.Context, name, ip string) error {
+	sb.config.extraHosts = append(sb.config.extraHosts, extraHost{name: name, IP: ip})
+	return sb.rebuildHostsFile(ctx)
+}
+
+// UpdateHostsEntry updates the IP address in a /etc/hosts entry where the
+// name matches the regular expression regexp.
+func (sb *Sandbox) UpdateHostsEntry(regexp, ip string) error {
+	return etchosts.Update(sb.config.hostsPath, ip, regexp)
+}
+
+// rebuildHostsFile builds the container's /etc/hosts file, based on the current
+// state of the Sandbox (including extra hosts). If called after the container
+// namespace has been created, before the user process is started, the container's
+// support for IPv6 can be determined and IPv6 hosts will be included/excluded
+// accordingly.
+func (sb *Sandbox) rebuildHostsFile(ctx context.Context) error {
+	var ifaceIPs []netip.Addr
 	for _, ep := range sb.Endpoints() {
-		if err := sb.updateHostsFile(ep.getEtcHostsAddrs()); err != nil {
-			return errdefs.System(err)
-		}
+		ifaceIPs = append(ifaceIPs, ep.getEtcHostsAddrs()...)
+	}
+	if err := sb.buildHostsFile(ctx, ifaceIPs); err != nil {
+		return errdefs.System(err)
 	}
 	return nil
 }
@@ -48,7 +63,7 @@ func (sb *Sandbox) startResolver(restore bool) {
 		// have a gateway. So, if the Sandbox is only connected to an 'internal' network,
 		// it will not forward DNS requests to external resolvers. The resolver's
 		// proxyDNS setting is then updated as network Endpoints are added/removed.
-		sb.resolver = NewResolver(resolverIPSandbox, sb.getGatewayEndpoint() != nil, sb)
+		sb.resolver = NewResolver(resolverIPSandbox, sb.hasExternalAccess(), sb)
 		defer func() {
 			if err != nil {
 				sb.resolver = nil
@@ -79,7 +94,10 @@ func (sb *Sandbox) startResolver(restore bool) {
 	})
 }
 
-func (sb *Sandbox) setupResolutionFiles() error {
+func (sb *Sandbox) setupResolutionFiles(ctx context.Context) error {
+	_, span := otel.Tracer("").Start(ctx, "libnetwork.Sandbox.setupResolutionFiles")
+	defer span.End()
+
 	// Create a hosts file that can be mounted during container setup. For most
 	// networking modes (not host networking) it will be re-created before the
 	// container start, once its support for IPv6 is known.
@@ -90,14 +108,17 @@ func (sb *Sandbox) setupResolutionFiles() error {
 	if err := createBasePath(dir); err != nil {
 		return err
 	}
-	if err := sb.buildHostsFile(); err != nil {
+	if err := sb.buildHostsFile(ctx, nil); err != nil {
 		return err
 	}
 
 	return sb.setupDNS()
 }
 
-func (sb *Sandbox) buildHostsFile() error {
+func (sb *Sandbox) buildHostsFile(ctx context.Context, ifaceIPs []netip.Addr) error {
+	ctx, span := otel.Tracer("").Start(ctx, "libnetwork.buildHostsFile")
+	defer span.End()
+
 	sb.restoreHostsPath()
 
 	dir, _ := filepath.Split(sb.config.hostsPath)
@@ -105,7 +126,11 @@ func (sb *Sandbox) buildHostsFile() error {
 		return err
 	}
 
-	// This is for the host mode networking
+	// This is for the host mode networking. If extra hosts are supplied, even though
+	// it's host-networking, the container's hosts file is not based on the host's -
+	// so that it's possible to override a hostname that's in the host's hosts file.
+	// See analysis of how this came about in:
+	// https://github.com/moby/moby/pull/48823#issuecomment-2461777129
 	if sb.config.useDefaultSandBox && len(sb.config.extraHosts) == 0 {
 		// We are working under the assumption that the origin file option had been properly expressed by the upper layer
 		// if not here we are going to error out
@@ -115,102 +140,69 @@ func (sb *Sandbox) buildHostsFile() error {
 		return nil
 	}
 
-	extraContent := make([]etchosts.Record, 0, len(sb.config.extraHosts))
-	for _, extraHost := range sb.config.extraHosts {
-		extraContent = append(extraContent, etchosts.Record{Hosts: extraHost.name, IP: extraHost.IP})
+	extraContent := make([]etchosts.Record, 0, len(sb.config.extraHosts)+len(ifaceIPs))
+	for _, host := range sb.config.extraHosts {
+		addr, err := netip.ParseAddr(host.IP)
+		if err != nil {
+			return errdefs.InvalidParameter(fmt.Errorf("could not parse extra host IP %s: %v", host.IP, err))
+		}
+		extraContent = append(extraContent, etchosts.Record{Hosts: host.name, IP: addr})
 	}
+	extraContent = append(extraContent, sb.makeHostsRecs(ifaceIPs)...)
 
 	// Assume IPv6 support, unless it's definitely disabled.
-	buildf := etchosts.Build
-	if en, ok := sb.ipv6Enabled(); ok && !en {
-		buildf = etchosts.BuildNoIPv6
+	if en, ok := sb.IPv6Enabled(); ok && !en {
+		return etchosts.BuildNoIPv6(sb.config.hostsPath, extraContent)
 	}
-	if err := buildf(sb.config.hostsPath, extraContent); err != nil {
-		return err
-	}
-
-	return sb.updateParentHosts()
+	return etchosts.Build(sb.config.hostsPath, extraContent)
 }
 
-func (sb *Sandbox) updateHostsFile(ifaceIPs []string) error {
+func (sb *Sandbox) makeHostsRecs(ifaceIPs []netip.Addr) []etchosts.Record {
 	if len(ifaceIPs) == 0 {
-		return nil
-	}
-
-	if sb.config.originHostsPath != "" {
 		return nil
 	}
 
 	// User might have provided a FQDN in hostname or split it across hostname
 	// and domainname.  We want the FQDN and the bare hostname.
-	fqdn := sb.config.hostName
+	hosts := sb.config.hostName
 	if sb.config.domainName != "" {
-		fqdn += "." + sb.config.domainName
-	}
-	hosts := fqdn
-
-	if hostName, _, ok := strings.Cut(fqdn, "."); ok {
-		hosts += " " + hostName
+		hosts += "." + sb.config.domainName
 	}
 
-	var extraContent []etchosts.Record
+	if hn, _, ok := strings.Cut(hosts, "."); ok {
+		hosts += " " + hn
+	}
+
+	var recs []etchosts.Record
 	for _, ip := range ifaceIPs {
-		extraContent = append(extraContent, etchosts.Record{Hosts: hosts, IP: ip})
+		recs = append(recs, etchosts.Record{Hosts: hosts, IP: ip})
 	}
-
-	sb.addHostsEntries(extraContent)
-	return nil
+	return recs
 }
 
-func (sb *Sandbox) addHostsEntries(recs []etchosts.Record) {
+func (sb *Sandbox) addHostsEntries(ctx context.Context, ifaceAddrs []netip.Addr) {
+	ctx, span := otel.Tracer("").Start(ctx, "libnetwork.addHostsEntries")
+	defer span.End()
+
 	// Assume IPv6 support, unless it's definitely disabled.
-	if en, ok := sb.ipv6Enabled(); ok && !en {
-		var filtered []etchosts.Record
-		for _, rec := range recs {
-			if addr, err := netip.ParseAddr(rec.IP); err == nil && !addr.Is6() {
-				filtered = append(filtered, rec)
+	if en, ok := sb.IPv6Enabled(); ok && !en {
+		var filtered []netip.Addr
+		for _, addr := range ifaceAddrs {
+			if !addr.Is6() {
+				filtered = append(filtered, addr)
 			}
 		}
-		recs = filtered
+		ifaceAddrs = filtered
 	}
-	if err := etchosts.Add(sb.config.hostsPath, recs); err != nil {
+	if err := etchosts.Add(sb.config.hostsPath, sb.makeHostsRecs(ifaceAddrs)); err != nil {
 		log.G(context.TODO()).Warnf("Failed adding service host entries to the running container: %v", err)
 	}
 }
 
-func (sb *Sandbox) deleteHostsEntries(recs []etchosts.Record) {
-	if err := etchosts.Delete(sb.config.hostsPath, recs); err != nil {
+func (sb *Sandbox) deleteHostsEntries(ifaceAddrs []netip.Addr) {
+	if err := etchosts.Delete(sb.config.hostsPath, sb.makeHostsRecs(ifaceAddrs)); err != nil {
 		log.G(context.TODO()).Warnf("Failed deleting service host entries to the running container: %v", err)
 	}
-}
-
-func (sb *Sandbox) updateParentHosts() error {
-	var pSb *Sandbox
-
-	for _, update := range sb.config.parentUpdates {
-		// TODO(thaJeztah): was it intentional for this loop to re-use prior results of pSB? If not, we should make pSb local and always replace here.
-		if s, _ := sb.controller.GetSandbox(update.cid); s != nil {
-			pSb = s
-		}
-		if pSb == nil {
-			continue
-		}
-		// TODO(robmry) - filter out IPv6 addresses here if !sb.ipv6Enabled() but...
-		// - this is part of the implementation of '--link', which will be removed along
-		//   with the rest of legacy networking.
-		// - IPv6 addresses shouldn't be allocated if IPv6 is not available in a container,
-		//   and that change will come along later.
-		// - I think this may be dead code, it's not possible to start a parent container with
-		//   '--link child' unless the child has already started ("Error response from daemon:
-		//   Cannot link to a non running container"). So, when the child starts and this method
-		//   is called with updates for parents, the parents aren't running and GetSandbox()
-		//   returns nil.)
-		if err := etchosts.Update(pSb.config.hostsPath, update.ip, update.name); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 func (sb *Sandbox) restoreResolvConfPath() {
@@ -328,31 +320,16 @@ func (sb *Sandbox) rebuildDNS() error {
 		return err
 	}
 
-	// Check for IPv6 endpoints in this sandbox. If there are any, and the container has
-	// IPv6 enabled, upstream requests from the internal DNS resolver can be made from
-	// the container's namespace.
-	// TODO(robmry) - this can only check networks connected when the resolver is set up,
-	//  the configuration won't be updated if the container gets an IPv6 address later.
-	ipv6 := false
-	for _, ep := range sb.endpoints {
-		if ep.network.enableIPv6 {
-			if en, ok := sb.ipv6Enabled(); ok {
-				ipv6 = en
-			}
-			break
-		}
-	}
-
-	intNS, err := netip.ParseAddr(sb.resolver.NameServer())
-	if err != nil {
-		return err
+	intNS := sb.resolver.NameServer()
+	if !intNS.IsValid() {
+		return fmt.Errorf("no listen-address for internal resolver")
 	}
 
 	// Work out whether ndots has been set from host config or overrides.
 	_, sb.ndotsSet = rc.Option("ndots")
 	// Swap nameservers for the internal one, and make sure the required options are set.
 	var extNameServers []resolvconf.ExtDNSEntry
-	extNameServers, err = rc.TransformForIntNS(ipv6, intNS, sb.resolver.ResolverOptions())
+	extNameServers, err = rc.TransformForIntNS(intNS, sb.resolver.ResolverOptions())
 	if err != nil {
 		return err
 	}

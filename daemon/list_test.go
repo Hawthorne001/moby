@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/container"
@@ -68,7 +67,7 @@ func setupContainerWithName(t *testing.T, name string, daemon *Daemon) *containe
 	return c
 }
 
-func containerListContainsName(containers []*types.Container, name string) bool {
+func containerListContainsName(containers []*containertypes.Summary, name string) bool {
 	for _, ctr := range containers {
 		for _, containerName := range ctr.Names {
 			if containerName == name {
@@ -82,7 +81,7 @@ func containerListContainsName(containers []*types.Container, name string) bool 
 
 func TestListInvalidFilter(t *testing.T) {
 	db, err := container.NewViewDB()
-	assert.Assert(t, err == nil)
+	assert.NilError(t, err)
 	d := &Daemon{
 		containersReplica: db,
 	}
@@ -95,7 +94,7 @@ func TestListInvalidFilter(t *testing.T) {
 
 func TestNameFilter(t *testing.T) {
 	db, err := container.NewViewDB()
-	assert.Assert(t, err == nil)
+	assert.NilError(t, err)
 	d := &Daemon{
 		containersReplica: db,
 	}
