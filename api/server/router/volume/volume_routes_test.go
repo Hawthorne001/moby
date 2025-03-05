@@ -11,7 +11,6 @@ import (
 	"gotest.tools/v3/assert"
 
 	"github.com/docker/docker/api/server/httputils"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
@@ -189,17 +188,16 @@ func TestCreateRegularVolume(t *testing.T) {
 		Driver: "foodriver",
 	}
 
-	buf := bytes.Buffer{}
-	e := json.NewEncoder(&buf)
-	e.Encode(volumeCreate)
+	var buf bytes.Buffer
+	err := json.NewEncoder(&buf).Encode(volumeCreate)
+	assert.NilError(t, err)
 
 	ctx := context.WithValue(context.Background(), httputils.APIVersionKey{}, clusterVolumesVersion)
 	req := httptest.NewRequest("POST", "/volumes/create", &buf)
 	req.Header.Add("Content-Type", "application/json")
 
 	resp := httptest.NewRecorder()
-	err := v.postVolumesCreate(ctx, resp, req, nil)
-
+	err = v.postVolumesCreate(ctx, resp, req, nil)
 	assert.NilError(t, err)
 
 	respVolume := volume.Volume{}
@@ -228,16 +226,16 @@ func TestCreateSwarmVolumeNoSwarm(t *testing.T) {
 		Driver:            "someCSI",
 	}
 
-	buf := bytes.Buffer{}
-	json.NewEncoder(&buf).Encode(volumeCreate)
+	var buf bytes.Buffer
+	err := json.NewEncoder(&buf).Encode(volumeCreate)
+	assert.NilError(t, err)
 
 	ctx := context.WithValue(context.Background(), httputils.APIVersionKey{}, clusterVolumesVersion)
 	req := httptest.NewRequest("POST", "/volumes/create", &buf)
 	req.Header.Add("Content-Type", "application/json")
 
 	resp := httptest.NewRecorder()
-	err := v.postVolumesCreate(ctx, resp, req, nil)
-
+	err = v.postVolumesCreate(ctx, resp, req, nil)
 	assert.Assert(t, err != nil)
 	assert.Assert(t, errdefs.IsUnavailable(err))
 }
@@ -257,16 +255,16 @@ func TestCreateSwarmVolumeNotManager(t *testing.T) {
 		Driver:            "someCSI",
 	}
 
-	buf := bytes.Buffer{}
-	json.NewEncoder(&buf).Encode(volumeCreate)
+	var buf bytes.Buffer
+	err := json.NewEncoder(&buf).Encode(volumeCreate)
+	assert.NilError(t, err)
 
 	ctx := context.WithValue(context.Background(), httputils.APIVersionKey{}, clusterVolumesVersion)
 	req := httptest.NewRequest("POST", "/volumes/create", &buf)
 	req.Header.Add("Content-Type", "application/json")
 
 	resp := httptest.NewRecorder()
-	err := v.postVolumesCreate(ctx, resp, req, nil)
-
+	err = v.postVolumesCreate(ctx, resp, req, nil)
 	assert.Assert(t, err != nil)
 	assert.Assert(t, errdefs.IsUnavailable(err))
 }
@@ -289,16 +287,16 @@ func TestCreateVolumeCluster(t *testing.T) {
 		Driver:            "someCSI",
 	}
 
-	buf := bytes.Buffer{}
-	json.NewEncoder(&buf).Encode(volumeCreate)
+	var buf bytes.Buffer
+	err := json.NewEncoder(&buf).Encode(volumeCreate)
+	assert.NilError(t, err)
 
 	ctx := context.WithValue(context.Background(), httputils.APIVersionKey{}, clusterVolumesVersion)
 	req := httptest.NewRequest("POST", "/volumes/create", &buf)
 	req.Header.Add("Content-Type", "application/json")
 
 	resp := httptest.NewRecorder()
-	err := v.postVolumesCreate(ctx, resp, req, nil)
-
+	err = v.postVolumesCreate(ctx, resp, req, nil)
 	assert.NilError(t, err)
 
 	respVolume := volume.Volume{}
@@ -336,15 +334,17 @@ func TestUpdateVolume(t *testing.T) {
 		Spec: &volume.ClusterVolumeSpec{},
 	}
 
-	buf := bytes.Buffer{}
-	json.NewEncoder(&buf).Encode(volumeUpdate)
+	var buf bytes.Buffer
+	err := json.NewEncoder(&buf).Encode(volumeUpdate)
+	assert.NilError(t, err)
+
 	ctx := context.WithValue(context.Background(), httputils.APIVersionKey{}, clusterVolumesVersion)
 	req := httptest.NewRequest("POST", "/volumes/vol1/update?version=0", &buf)
 	req.Header.Add("Content-Type", "application/json")
 
 	resp := httptest.NewRecorder()
 
-	err := v.putVolumesUpdate(ctx, resp, req, map[string]string{"name": "vol1"})
+	err = v.putVolumesUpdate(ctx, resp, req, map[string]string{"name": "vol1"})
 	assert.NilError(t, err)
 
 	assert.Equal(t, c.volumes["vol1"].ClusterVolume.Meta.Version.Index, uint64(1))
@@ -363,15 +363,17 @@ func TestUpdateVolumeNoSwarm(t *testing.T) {
 		Spec: &volume.ClusterVolumeSpec{},
 	}
 
-	buf := bytes.Buffer{}
-	json.NewEncoder(&buf).Encode(volumeUpdate)
+	var buf bytes.Buffer
+	err := json.NewEncoder(&buf).Encode(volumeUpdate)
+	assert.NilError(t, err)
+
 	ctx := context.WithValue(context.Background(), httputils.APIVersionKey{}, clusterVolumesVersion)
 	req := httptest.NewRequest("POST", "/volumes/vol1/update?version=0", &buf)
 	req.Header.Add("Content-Type", "application/json")
 
 	resp := httptest.NewRecorder()
 
-	err := v.putVolumesUpdate(ctx, resp, req, map[string]string{"name": "vol1"})
+	err = v.putVolumesUpdate(ctx, resp, req, map[string]string{"name": "vol1"})
 	assert.Assert(t, err != nil)
 	assert.Assert(t, errdefs.IsUnavailable(err))
 }
@@ -393,15 +395,17 @@ func TestUpdateVolumeNotFound(t *testing.T) {
 		Spec: &volume.ClusterVolumeSpec{},
 	}
 
-	buf := bytes.Buffer{}
-	json.NewEncoder(&buf).Encode(volumeUpdate)
+	var buf bytes.Buffer
+	err := json.NewEncoder(&buf).Encode(volumeUpdate)
+	assert.NilError(t, err)
+
 	ctx := context.WithValue(context.Background(), httputils.APIVersionKey{}, clusterVolumesVersion)
 	req := httptest.NewRequest("POST", "/volumes/vol1/update?version=0", &buf)
 	req.Header.Add("Content-Type", "application/json")
 
 	resp := httptest.NewRecorder()
 
-	err := v.putVolumesUpdate(ctx, resp, req, map[string]string{"name": "vol1"})
+	err = v.putVolumesUpdate(ctx, resp, req, map[string]string{"name": "vol1"})
 	assert.Assert(t, err != nil)
 	assert.Assert(t, errdefs.IsNotFound(err))
 }
@@ -582,7 +586,7 @@ type fakeVolumeBackend struct {
 }
 
 func (b *fakeVolumeBackend) List(_ context.Context, _ filters.Args) ([]*volume.Volume, []string, error) {
-	volumes := []*volume.Volume{}
+	var volumes []*volume.Volume
 	for _, v := range b.volumes {
 		volumes = append(volumes, v)
 	}
@@ -636,7 +640,7 @@ func (b *fakeVolumeBackend) Remove(_ context.Context, name string, o ...opts.Rem
 	return nil
 }
 
-func (b *fakeVolumeBackend) Prune(_ context.Context, _ filters.Args) (*types.VolumesPruneReport, error) {
+func (b *fakeVolumeBackend) Prune(_ context.Context, _ filters.Args) (*volume.PruneReport, error) {
 	return nil, nil
 }
 
@@ -672,13 +676,12 @@ func (c *fakeClusterBackend) GetVolume(nameOrID string) (volume.Volume, error) {
 	return volume.Volume{}, errdefs.NotFound(fmt.Errorf("volume %s not found", nameOrID))
 }
 
-func (c *fakeClusterBackend) GetVolumes(options volume.ListOptions) ([]*volume.Volume, error) {
+func (c *fakeClusterBackend) GetVolumes(_ volume.ListOptions) ([]*volume.Volume, error) {
 	if err := c.checkSwarm(); err != nil {
 		return nil, err
 	}
 
-	volumes := []*volume.Volume{}
-
+	var volumes []*volume.Volume
 	for _, v := range c.volumes {
 		volumes = append(volumes, v)
 	}

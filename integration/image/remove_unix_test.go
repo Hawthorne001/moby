@@ -52,7 +52,6 @@ func TestRemoveImageGarbageCollector(t *testing.T) {
 		GraphDriver:               d.StorageDriver(),
 		GraphDriverOptions:        nil,
 		IDMapping:                 idtools.IdentityMapping{},
-		PluginGetter:              nil,
 		ExperimentalEnabled:       false,
 	})
 	i := images.NewImageService(images.ImageServiceConfig{
@@ -77,7 +76,7 @@ func TestRemoveImageGarbageCollector(t *testing.T) {
 	_, err = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	assert.NilError(t, err)
-	img, _, err := client.ImageInspectWithRaw(ctx, imgName)
+	img, err := client.ImageInspect(ctx, imgName)
 	assert.NilError(t, err)
 
 	// Mark latest image layer to immutable
@@ -85,7 +84,7 @@ func TestRemoveImageGarbageCollector(t *testing.T) {
 	file, _ := os.Open(data["UpperDir"])
 	attr := 0x00000010
 	fsflags := uintptr(0x40086602)
-	argp := uintptr(unsafe.Pointer(&attr))
+	argp := uintptr(unsafe.Pointer(&attr)) // #nosec G103 -- Ignore "G103: Use of unsafe calls should be audited"
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), fsflags, argp)
 	assert.Equal(t, "errno 0", errno.Error())
 
@@ -93,7 +92,7 @@ func TestRemoveImageGarbageCollector(t *testing.T) {
 	// but marking layer back to mutable before checking errors (so we don't break CI server)
 	_, err = client.ImageRemove(ctx, imgName, image.RemoveOptions{})
 	attr = 0x00000000
-	argp = uintptr(unsafe.Pointer(&attr))
+	argp = uintptr(unsafe.Pointer(&attr)) // #nosec G103 -- Ignore "G103: Use of unsafe calls should be audited"
 	_, _, errno = syscall.Syscall(syscall.SYS_IOCTL, file.Fd(), fsflags, argp)
 	assert.Equal(t, "errno 0", errno.Error())
 	assert.Assert(t, err != nil)

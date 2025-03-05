@@ -16,6 +16,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/docker/docker/daemon/names"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/pkg/atomicwriter"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/quota"
 	"github.com/docker/docker/volume"
@@ -388,7 +389,7 @@ func (v *localVolume) saveOpts() error {
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(filepath.Join(v.rootPath, "opts.json"), b, 0o600)
+	err = atomicwriter.WriteFile(filepath.Join(v.rootPath, "opts.json"), b, 0o600)
 	if err != nil {
 		return errdefs.System(errors.Wrap(err, "error while persisting volume options"))
 	}

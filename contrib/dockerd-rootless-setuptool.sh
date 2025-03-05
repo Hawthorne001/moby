@@ -228,8 +228,13 @@ init() {
 		fi
 	fi
 
-	# instructions: validate subuid/subgid files for current user
-	if ! grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subuid 2> /dev/null; then
+	# instructions: validate subuid for current user
+	if command -v "getsubids" > /dev/null 2>&1; then
+		getsubids "$USERNAME" > /dev/null 2>&1 || getsubids "$(id -u)" > /dev/null 2>&1
+	else
+		grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subuid 2> /dev/null
+	fi
+	if [ $? -ne 0 ]; then
 		instructions=$(
 			cat <<- EOI
 				${instructions}
@@ -238,7 +243,14 @@ init() {
 			EOI
 		)
 	fi
-	if ! grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subgid 2> /dev/null; then
+
+	# instructions: validate subgid for current user
+	if command -v "getsubids" > /dev/null 2>&1; then
+		getsubids -g "$USERNAME" > /dev/null 2>&1 || getsubids -g "$(id -u)" > /dev/null 2>&1
+	else
+		grep -q "^$USERNAME_ESCAPED:\|^$(id -u):" /etc/subgid 2> /dev/null
+	fi
+	if [ $? -ne 0 ]; then
 		instructions=$(
 			cat <<- EOI
 				${instructions}
@@ -269,13 +281,6 @@ init() {
 	# - sysctl: "net.ipv4.ip_unprivileged_port_start"
 	# - external binary: slirp4netns
 	# - external binary: fuse-overlayfs
-
-	# check RootlessKit functionality. RootlessKit will print hints if something is still unsatisfied.
-	# (e.g., `kernel.apparmor_restrict_unprivileged_userns` constraint)
-	if ! rootlesskit true; then
-		ERROR "RootlessKit failed, see the error messages and https://rootlesscontaine.rs/getting-started/common/ ."
-		exit 1
-	fi
 }
 
 # CLI subcommand: "check"
@@ -314,6 +319,7 @@ install_systemd() {
 			[Unit]
 			Description=Docker Application Container Engine (Rootless)
 			Documentation=https://docs.docker.com/go/rootless/
+			Requires=dbus.socket
 
 			[Service]
 			Environment=PATH=$BIN:/sbin:/usr/sbin:$PATH
@@ -399,7 +405,20 @@ cli_ctx_rm() {
 # CLI subcommand: "install"
 cmd_entrypoint_install() {
 	init
-	# requirements are already checked in init()
+	# Most requirements are already checked in init(), except the smoke test below for RootlessKit.
+	# https://github.com/docker/docker-install/issues/417
+
+	# check RootlessKit functionality. RootlessKit will print hints if something is still unsatisfied.
+	# (e.g., `kernel.apparmor_restrict_unprivileged_userns` constraint)
+	if ! rootlesskit true; then
+		if [ -z "$OPT_FORCE" ]; then
+			ERROR "RootlessKit failed, see the error messages and https://rootlesscontaine.rs/getting-started/common/ . Set --force to ignore."
+			exit 1
+		else
+			WARNING "RootlessKit failed, see the error messages and https://rootlesscontaine.rs/getting-started/common/ ."
+		fi
+	fi
+
 	if [ -z "$SYSTEMD" ]; then
 		install_nonsystemd
 	else

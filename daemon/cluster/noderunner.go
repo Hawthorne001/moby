@@ -131,7 +131,7 @@ func (n *nodeRunner) start(conf nodeStartConfig) error {
 			VXLANUDPPort:    conf.DataPathPort,
 		},
 		JoinAddr:  joinAddr,
-		StateDir:  n.cluster.root,
+		StateDir:  n.cluster.stateDir,
 		JoinToken: conf.joinToken,
 		Executor: container.NewExecutor(
 			n.cluster.config.Backend,
@@ -171,7 +171,7 @@ func (n *nodeRunner) start(conf nodeStartConfig) error {
 		conf.JoinInProgress = true
 	}
 	n.config = conf
-	savePersistentState(n.cluster.root, conf)
+	savePersistentState(n.cluster.stateDir, conf)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -262,7 +262,7 @@ func (n *nodeRunner) handleReadyEvent(ctx context.Context, node *swarmnode.Node,
 		n.err = nil
 		if n.config.JoinInProgress {
 			n.config.JoinInProgress = false
-			savePersistentState(n.cluster.root, n.config)
+			savePersistentState(n.cluster.stateDir, n.config)
 		}
 		n.mu.Unlock()
 		close(ready)
@@ -282,6 +282,19 @@ func (n *nodeRunner) handleNodeExit(node *swarmnode.Node) {
 	close(n.done)
 	select {
 	case <-n.ready:
+		// there is a case where a node can be promoted to manager while
+		// another node is leaving the cluster. the node being promoted, by
+		// random chance, picks the IP of the node being demoted as the one it
+		// tries to connect to. in this case, the promotion will fail, and the
+		// whole swarm Node object packs it in.
+		//
+		// when the Node object is relaunched by this code, because it has
+		// joinAddr in the config, it attempts again to connect to the same
+		// no-longer-manager node, and crashes again. this continues forever.
+		//
+		// to avoid this case, in this block, we remove JoinAddr from the
+		// config.
+		n.config.joinAddr = ""
 		n.enableReconnectWatcher()
 	default:
 		if n.repeatedRun {

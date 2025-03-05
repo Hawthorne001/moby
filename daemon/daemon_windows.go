@@ -15,6 +15,7 @@ import (
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/config"
+	"github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/libcontainerd/local"
 	"github.com/docker/docker/libcontainerd/remote"
 	"github.com/docker/docker/libnetwork"
@@ -24,11 +25,9 @@ import (
 	"github.com/docker/docker/libnetwork/options"
 	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/parsers/operatingsystem"
 	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/pkg/system"
-	"github.com/docker/docker/runconfig"
 	"github.com/pkg/errors"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -40,9 +39,6 @@ const (
 	windowsMaxCPUShares  = 10000
 	windowsMinCPUPercent = 1
 	windowsMaxCPUPercent = 100
-
-	windowsV1RuntimeName = "com.docker.hcsshim.v1"
-	windowsV2RuntimeName = "io.containerd.runhcs.v1"
 )
 
 // Windows containers are much larger than Linux containers and each of them
@@ -112,8 +108,11 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, isHyp
 	}
 	// The precision we could get is 0.01, because on Windows we have to convert to CPUPercent.
 	// We don't set the lower limit here and it is up to the underlying platform (e.g., Windows) to return an error.
-	if resources.NanoCPUs < 0 || resources.NanoCPUs > int64(sysinfo.NumCPU())*1e9 {
-		return warnings, fmt.Errorf("range of CPUs is from 0.01 to %d.00, as there are only %d CPUs available", sysinfo.NumCPU(), sysinfo.NumCPU())
+	if resources.NanoCPUs != 0 {
+		nc := runtime.NumCPU()
+		if resources.NanoCPUs < 0 || resources.NanoCPUs > int64(nc)*1e9 {
+			return warnings, fmt.Errorf("range of CPUs is from 0.01 to %[1]d.00, as there are only %[1]d CPUs available", nc)
+		}
 	}
 
 	if len(resources.BlkioDeviceReadBps) > 0 {
@@ -229,12 +228,12 @@ func configureKernelSecuritySupport(config *config.Config, driverName string) er
 }
 
 // configureMaxThreads sets the Go runtime max threads threshold
-func configureMaxThreads(config *config.Config) error {
+func configureMaxThreads(_ context.Context) error {
 	return nil
 }
 
 func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSandboxes map[string]interface{}) error {
-	netOptions, err := daemon.networkOptions(daemonCfg, nil, nil)
+	netOptions, err := daemon.networkOptions(daemonCfg, nil, daemon.id, nil)
 	if err != nil {
 		return err
 	}
@@ -309,7 +308,7 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 
 	defaultNetworkExists := false
 
-	if network, err := daemon.netController.NetworkByName(runconfig.DefaultDaemonNetworkMode().NetworkName()); err == nil {
+	if network, err := daemon.netController.NetworkByName(network.DefaultNetwork); err == nil {
 		hnsid := network.DriverOptions()[winlibnetwork.HNSID]
 		for _, v := range hnsresponse {
 			if hnsid == v.Id {
@@ -337,6 +336,7 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 		})
 
 		drvOptions := make(map[string]string)
+		var labels map[string]string
 		nid := ""
 		if n != nil {
 			nid = n.ID()
@@ -351,6 +351,7 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 
 			// restore option if it existed before
 			drvOptions = n.DriverOptions()
+			labels = n.Labels()
 			n.Delete()
 		}
 		netOption := map[string]string{
@@ -377,10 +378,8 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 
 		// If there is no nat network create one from the first NAT network
 		// encountered if it doesn't already exist
-		if !defaultNetworkExists &&
-			runconfig.DefaultDaemonNetworkMode() == containertypes.NetworkMode(strings.ToLower(v.Type)) &&
-			n == nil {
-			name = runconfig.DefaultDaemonNetworkMode().NetworkName()
+		if !defaultNetworkExists && strings.EqualFold(network.DefaultNetwork, v.Type) && n == nil {
+			name = network.DefaultNetwork
 			defaultNetworkExists = true
 		}
 
@@ -388,8 +387,10 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 		_, err := daemon.netController.NewNetwork(strings.ToLower(v.Type), name, nid,
 			libnetwork.NetworkOptionGeneric(options.Generic{
 				netlabel.GenericData: netOption,
+				netlabel.EnableIPv4:  true,
 			}),
 			libnetwork.NetworkOptionIpam("default", "", v4Conf, v6Conf, nil),
+			libnetwork.NetworkOptionLabels(labels),
 		)
 		if err != nil {
 			log.G(context.TODO()).Errorf("Error occurred when creating network %v", err)
@@ -407,12 +408,12 @@ func (daemon *Daemon) initNetworkController(daemonCfg *config.Config, activeSand
 }
 
 func initBridgeDriver(controller *libnetwork.Controller, config config.BridgeConfig) error {
-	if _, err := controller.NetworkByName(runconfig.DefaultDaemonNetworkMode().NetworkName()); err == nil {
+	if _, err := controller.NetworkByName(network.DefaultNetwork); err == nil {
 		return nil
 	}
 
 	netOption := map[string]string{
-		winlibnetwork.NetworkName: runconfig.DefaultDaemonNetworkMode().NetworkName(),
+		winlibnetwork.NetworkName: network.DefaultNetwork,
 	}
 
 	var ipamOption libnetwork.NetworkOption
@@ -429,9 +430,10 @@ func initBridgeDriver(controller *libnetwork.Controller, config config.BridgeCon
 		ipamOption = libnetwork.NetworkOptionIpam("default", "", v4Conf, v6Conf, nil)
 	}
 
-	_, err := controller.NewNetwork(string(runconfig.DefaultDaemonNetworkMode()), runconfig.DefaultDaemonNetworkMode().NetworkName(), "",
+	_, err := controller.NewNetwork(network.DefaultNetwork, network.DefaultNetwork, "",
 		libnetwork.NetworkOptionGeneric(options.Generic{
 			netlabel.GenericData: netOption,
+			netlabel.EnableIPv4:  true,
 		}),
 		ipamOption,
 	)
@@ -520,34 +522,24 @@ func (daemon *Daemon) setDefaultIsolation(config *config.Config) error {
 	} else {
 		daemon.defaultIsolation = containertypes.IsolationProcess
 	}
-	for _, option := range config.ExecOptions {
-		key, val, err := parsers.ParseKeyValueOpt(option)
-		if err != nil {
-			return err
+	val, ok, err := config.GetExecOpt("isolation")
+	if err != nil {
+		return err
+	}
+	if ok {
+		isolation := containertypes.Isolation(strings.ToLower(val))
+		if !isolation.IsValid() {
+			return fmt.Errorf("invalid exec-opt value for 'isolation':'%s'", val)
 		}
-		key = strings.ToLower(key)
-		switch key {
-
-		case "isolation":
-			if !containertypes.Isolation(val).IsValid() {
-				return fmt.Errorf("Invalid exec-opt value for 'isolation':'%s'", val)
-			}
-			if containertypes.Isolation(val).IsHyperV() {
-				daemon.defaultIsolation = containertypes.IsolationHyperV
-			}
-			if containertypes.Isolation(val).IsProcess() {
-				daemon.defaultIsolation = containertypes.IsolationProcess
-			}
-		default:
-			return fmt.Errorf("Unrecognised exec-opt '%s'\n", key)
+		if isolation.IsHyperV() {
+			daemon.defaultIsolation = containertypes.IsolationHyperV
+		}
+		if isolation.IsProcess() {
+			daemon.defaultIsolation = containertypes.IsolationProcess
 		}
 	}
 
 	log.G(context.TODO()).Infof("Windows default isolation mode: %s", daemon.defaultIsolation)
-	return nil
-}
-
-func setMayDetachMounts() error {
 	return nil
 }
 
@@ -567,22 +559,16 @@ func (daemon *Daemon) initLibcontainerd(ctx context.Context, cfg *config.Config)
 	rt := cfg.DefaultRuntime
 	if rt == "" {
 		if cfg.ContainerdAddr == "" {
-			rt = windowsV1RuntimeName
+			rt = config.WindowsV1RuntimeName
 		} else {
-			rt = windowsV2RuntimeName
+			rt = config.WindowsV2RuntimeName
 		}
 	}
 
 	switch rt {
-	case windowsV1RuntimeName:
-		daemon.containerd, err = local.NewClient(
-			ctx,
-			daemon.containerdClient,
-			filepath.Join(cfg.ExecRoot, "containerd"),
-			cfg.ContainerdNamespace,
-			daemon,
-		)
-	case windowsV2RuntimeName:
+	case config.WindowsV1RuntimeName:
+		daemon.containerd, err = local.NewClient(ctx, daemon)
+	case config.WindowsV2RuntimeName:
 		if cfg.ContainerdAddr == "" {
 			return fmt.Errorf("cannot use the specified runtime %q without containerd", rt)
 		}
