@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/platforms"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver/pb"
@@ -27,7 +27,6 @@ var qemuArchMap = map[string]string{
 	"riscv64": "riscv64",
 	"arm":     "arm",
 	"s390x":   "s390x",
-	"ppc64":   "ppc64",
 	"ppc64le": "ppc64le",
 	"386":     "i386",
 }
@@ -85,7 +84,7 @@ func (m *staticEmulatorMount) IdentityMapping() *idtools.IdentityMapping {
 	return m.idmap
 }
 
-func getEmulator(ctx context.Context, p *pb.Platform, idmap *idtools.IdentityMapping) (*emulator, error) {
+func getEmulator(ctx context.Context, p *pb.Platform) (*emulator, error) {
 	all := archutil.SupportedPlatforms(false)
 	pp := platforms.Normalize(ocispecs.Platform{
 		Architecture: p.Architecture,

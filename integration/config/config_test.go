@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	swarmtypes "github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/client"
@@ -107,7 +108,6 @@ func TestConfigList(t *testing.T) {
 		},
 	}
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.desc, func(t *testing.T) {
 			ctx := testutil.StartSpan(ctx, t)
 			entries, err = c.ConfigList(ctx, types.ConfigListOptions{
@@ -267,7 +267,7 @@ func TestTemplatedConfig(t *testing.T) {
 	templatedConfig, err := c.ConfigCreate(ctx, configSpec)
 	assert.Check(t, err)
 
-	serviceName := "svc_" + t.Name()
+	const serviceName = "svc_templated_config"
 	serviceID := swarm.CreateService(ctx, t, d,
 		swarm.ServiceWithConfig(
 			&swarmtypes.ConfigReference{
@@ -313,23 +313,31 @@ func TestTemplatedConfig(t *testing.T) {
 	tasks := swarm.GetRunningTasks(ctx, t, c, serviceID)
 	assert.Assert(t, len(tasks) > 0, "no running tasks found for service %s", serviceID)
 
-	attach := swarm.ExecTask(ctx, t, d, tasks[0], types.ExecConfig{
+	resp := swarm.ExecTask(ctx, t, d, tasks[0], container.ExecOptions{
 		Cmd:          []string{"/bin/cat", "/templated_config"},
 		AttachStdout: true,
 		AttachStderr: true,
 	})
 
-	expect := "SERVICE_NAME=" + serviceName + "\n" +
-		"this is a secret\n" +
-		"this is a config\n"
-	assertAttachedStream(t, attach, expect)
+	const expect = "SERVICE_NAME=" + serviceName + "\nthis is a secret\nthis is a config\n"
+	var outBuf, errBuf bytes.Buffer
+	_, err = stdcopy.StdCopy(&outBuf, &errBuf, resp.Reader)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(outBuf.String(), expect))
+	assert.Check(t, is.Equal(errBuf.String(), ""))
 
-	attach = swarm.ExecTask(ctx, t, d, tasks[0], types.ExecConfig{
+	outBuf.Reset()
+	errBuf.Reset()
+	resp = swarm.ExecTask(ctx, t, d, tasks[0], container.ExecOptions{
 		Cmd:          []string{"mount"},
 		AttachStdout: true,
 		AttachStderr: true,
 	})
-	assertAttachedStream(t, attach, "tmpfs on /templated_config type tmpfs")
+
+	_, err = stdcopy.StdCopy(&outBuf, &errBuf, resp.Reader)
+	assert.NilError(t, err)
+	assert.Check(t, is.Contains(outBuf.String(), "tmpfs on /templated_config type tmpfs"), "expected to be mounted as tmpfs")
+	assert.Check(t, is.Equal(errBuf.String(), ""))
 }
 
 // Test case for 28884
@@ -380,13 +388,6 @@ func TestConfigCreateResolve(t *testing.T) {
 	entries, err = c.ConfigList(ctx, types.ConfigListOptions{})
 	assert.NilError(t, err)
 	assert.Assert(t, is.Equal(0, len(entries)))
-}
-
-func assertAttachedStream(t *testing.T, attach types.HijackedResponse, expect string) {
-	buf := bytes.NewBuffer(nil)
-	_, err := stdcopy.StdCopy(buf, buf, attach.Reader)
-	assert.NilError(t, err)
-	assert.Check(t, is.Contains(buf.String(), expect))
 }
 
 func configNamesFromList(entries []swarmtypes.Config) []string {

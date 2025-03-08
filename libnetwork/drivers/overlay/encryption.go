@@ -304,7 +304,7 @@ func (d *driver) programInput(vni uint32, add bool) error {
 	return nil
 }
 
-func programSA(localIP, remoteIP net.IP, spi *spi, k *key, dir int, add bool) (fSA *netlink.XfrmState, rSA *netlink.XfrmState, err error) {
+func programSA(localIP, remoteIP net.IP, spi *spi, k *key, dir int, add bool) (fSA *netlink.XfrmState, rSA *netlink.XfrmState, lastErr error) {
 	var (
 		action      = "Removing"
 		xfrmProgram = ns.NlHandle().XfrmStateDel
@@ -330,6 +330,7 @@ func programSA(localIP, remoteIP net.IP, spi *spi, k *key, dir int, add bool) (f
 
 		exists, err := saExists(rSA)
 		if err != nil {
+			lastErr = err
 			exists = !add
 		}
 
@@ -356,6 +357,7 @@ func programSA(localIP, remoteIP net.IP, spi *spi, k *key, dir int, add bool) (f
 
 		exists, err := saExists(fSA)
 		if err != nil {
+			lastErr = err
 			exists = !add
 		}
 
@@ -367,7 +369,7 @@ func programSA(localIP, remoteIP net.IP, spi *spi, k *key, dir int, add bool) (f
 		}
 	}
 
-	return
+	return fSA, rSA, lastErr
 }
 
 // getMinimalIP returns the address in its shortest form
@@ -679,7 +681,6 @@ func clearEncryptionStates() {
 		log.G(context.TODO()).Warnf("Failed to retrieve SA list for cleanup: %v", err)
 	}
 	for _, sp := range spList {
-		sp := sp
 		if sp.Mark != nil && sp.Mark.Value == spMark.Value {
 			if err := nlh.XfrmPolicyDel(&sp); err != nil {
 				log.G(context.TODO()).Warnf("Failed to delete stale SP %s: %v", sp, err)
@@ -689,7 +690,6 @@ func clearEncryptionStates() {
 		}
 	}
 	for _, sa := range saList {
-		sa := sa
 		if sa.Reqid == mark {
 			if err := nlh.XfrmStateDel(&sa); err != nil {
 				log.G(context.TODO()).Warnf("Failed to delete stale SA %s: %v", sa, err)

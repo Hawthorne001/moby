@@ -7,25 +7,37 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/leases"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/pkg/filters"
+	cerrdefs "github.com/containerd/errdefs"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/cmd/buildkitd/config"
 	"github.com/moby/buildkit/identity"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
+	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/db"
+	"github.com/moby/buildkit/util/gitutil"
+	"github.com/moby/buildkit/util/grpcerrors"
+	"github.com/moby/buildkit/util/iohelper"
 	"github.com/moby/buildkit/util/leaseutil"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	"github.com/tonistiigi/go-csvvalue"
 	bolt "go.etcd.io/bbolt"
+	spb "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -33,11 +45,20 @@ const (
 	versionBucket = "_version"
 )
 
+const (
+	statusRunning   = "running"
+	statusCompleted = "completed"
+	statusError     = "error"
+	statusCanceled  = "canceled"
+)
+
 type HistoryQueueOpt struct {
-	DB           *bolt.DB
-	LeaseManager *leaseutil.Manager
-	ContentStore *containerdsnapshot.Store
-	CleanConfig  *config.HistoryConfig
+	DB             db.Transactor
+	LeaseManager   *leaseutil.Manager
+	ContentStore   *containerdsnapshot.Store
+	CleanConfig    *config.HistoryConfig
+	GarbageCollect func(context.Context) error
+	GracefulStop   <-chan struct{}
 }
 
 type HistoryQueue struct {
@@ -47,10 +68,18 @@ type HistoryQueue struct {
 	opt           HistoryQueueOpt
 	ps            *pubsub[*controlapi.BuildHistoryEvent]
 	active        map[string]*controlapi.BuildHistoryRecord
+	finalizers    map[string]*finalizer
 	refs          map[string]int
 	deleted       map[string]struct{}
 	hContentStore *containerdsnapshot.Store
 	hLeaseManager *leaseutil.Manager
+}
+
+// finalizer controls completion of saving traces for a
+// record and making it immutable
+type finalizer struct {
+	trigger func()
+	done    chan struct{}
 }
 
 type StatusImportResult struct {
@@ -58,6 +87,7 @@ type StatusImportResult struct {
 	NumCachedSteps    int
 	NumCompletedSteps int
 	NumTotalSteps     int
+	NumWarnings       int
 }
 
 func NewHistoryQueue(opt HistoryQueueOpt) (*HistoryQueue, error) {
@@ -72,9 +102,10 @@ func NewHistoryQueue(opt HistoryQueueOpt) (*HistoryQueue, error) {
 		ps: &pubsub[*controlapi.BuildHistoryEvent]{
 			m: map[*channel[*controlapi.BuildHistoryEvent]]struct{}{},
 		},
-		active:  map[string]*controlapi.BuildHistoryRecord{},
-		refs:    map[string]int{},
-		deleted: map[string]struct{}{},
+		active:     map[string]*controlapi.BuildHistoryRecord{},
+		refs:       map[string]int{},
+		deleted:    map[string]struct{}{},
+		finalizers: map[string]*finalizer{},
 	}
 
 	ns := h.opt.ContentStore.Namespace()
@@ -111,9 +142,20 @@ func NewHistoryQueue(opt HistoryQueueOpt) (*HistoryQueue, error) {
 	}
 
 	go func() {
+		h.clearOrphans()
 		for {
 			h.gc()
 			time.Sleep(120 * time.Second)
+		}
+	}()
+
+	go func() {
+		<-h.opt.GracefulStop
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		// if active builds then close will happen in finalizer
+		if len(h.finalizers) == 0 && len(h.active) == 0 {
+			go h.ps.Close()
 		}
 	}()
 
@@ -132,11 +174,11 @@ func (h *HistoryQueue) migrateV2() error {
 		if err != nil {
 			return err
 		}
-		defer release(ctx)
+		defer release(context.WithoutCancel(ctx))
 		return b.ForEach(func(key, dt []byte) error {
 			recs, err := h.opt.LeaseManager.ListResources(ctx, leases.Lease{ID: h.leaseID(string(key))})
 			if err != nil {
-				if errdefs.IsNotFound(err) {
+				if cerrdefs.IsNotFound(err) {
 					return nil
 				}
 				return err
@@ -156,7 +198,7 @@ func (h *HistoryQueue) migrateV2() error {
 
 			l, err := h.hLeaseManager.Create(ctx, leases.WithID(h.leaseID(string(key))))
 			if err != nil {
-				if !errors.Is(err, errdefs.ErrAlreadyExists) {
+				if !errors.Is(err, cerrdefs.ErrAlreadyExists) {
 					return err
 				}
 				l = leases.Lease{ID: string(key)}
@@ -241,7 +283,7 @@ func (h *HistoryQueue) migrateBlobV2(ctx context.Context, id string, detectSkipL
 		Digest: dgst,
 	}), content.WithRef("history-migrate-"+id))
 	if err != nil {
-		if errdefs.IsAlreadyExists(err) {
+		if cerrdefs.IsAlreadyExists(err) {
 			return true, nil
 		}
 		return false, err
@@ -254,7 +296,7 @@ func (h *HistoryQueue) migrateBlobV2(ctx context.Context, id string, detectSkipL
 		return false, nil // allow skipping
 	}
 	defer ra.Close()
-	if err := content.Copy(ctx, w, &reader{ReaderAt: ra}, 0, dgst, content.WithLabels(labels)); err != nil {
+	if err := content.Copy(ctx, w, iohelper.ReadCloser(ra), 0, dgst, content.WithLabels(labels)); err != nil {
 		return false, err
 	}
 
@@ -275,7 +317,7 @@ func (h *HistoryQueue) gc() error {
 		}
 		return b.ForEach(func(key, dt []byte) error {
 			var br controlapi.BuildHistoryRecord
-			if err := br.Unmarshal(dt); err != nil {
+			if err := br.UnmarshalVT(dt); err != nil {
 				return errors.Wrapf(err, "failed to unmarshal build record %s", key)
 			}
 			if br.Pinned {
@@ -295,7 +337,7 @@ func (h *HistoryQueue) gc() error {
 
 	// sort array by newest records first
 	sort.Slice(records, func(i, j int) bool {
-		return records[i].CompletedAt.After(*records[j].CompletedAt)
+		return records[i].CompletedAt.AsTime().After(records[j].CompletedAt.AsTime())
 	})
 
 	h.mu.Lock()
@@ -303,8 +345,8 @@ func (h *HistoryQueue) gc() error {
 
 	now := time.Now()
 	for _, r := range records[h.opt.CleanConfig.MaxEntries:] {
-		if now.Add(-h.opt.CleanConfig.MaxAge.Duration).After(*r.CompletedAt) {
-			if err := h.delete(r.Ref, false); err != nil {
+		if now.Add(-h.opt.CleanConfig.MaxAge.Duration).After(r.CompletedAt.AsTime()) {
+			if _, err := h.delete(r.Ref); err != nil {
 				return err
 			}
 		}
@@ -313,10 +355,51 @@ func (h *HistoryQueue) gc() error {
 	return nil
 }
 
-func (h *HistoryQueue) delete(ref string, sync bool) error {
+func (h *HistoryQueue) clearOrphans() error {
+	ctx := context.Background()
+	var records []*controlapi.BuildHistoryRecord
+
+	if err := h.opt.DB.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(recordsBucket))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(key, dt []byte) error {
+			var br controlapi.BuildHistoryRecord
+			if err := proto.Unmarshal(dt, &br); err != nil {
+				return errors.Wrapf(err, "failed to unmarshal build record %s", key)
+			}
+			recs, err := h.hLeaseManager.ListResources(ctx, leases.Lease{ID: h.leaseID(string(key))})
+			if (err != nil && cerrdefs.IsNotFound(err)) || len(recs) == 0 {
+				records = append(records, &br)
+			}
+			return nil
+		})
+	}); err != nil {
+		return err
+	}
+
+	if len(records) == 0 {
+		return nil
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for _, r := range records {
+		bklog.G(ctx).Warnf("deleting build record %s due to missing blobs", r.Ref)
+		if _, err := h.delete(r.Ref); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (h *HistoryQueue) delete(ref string) (bool, error) {
 	if _, ok := h.refs[ref]; ok {
 		h.deleted[ref] = struct{}{}
-		return nil
+		return false, nil
 	}
 	delete(h.deleted, ref)
 	h.ps.Send(&controlapi.BuildHistoryEvent{
@@ -329,19 +412,15 @@ func (h *HistoryQueue) delete(ref string, sync bool) error {
 			return errors.Wrapf(os.ErrNotExist, "failed to retrieve bucket %s", recordsBucket)
 		}
 		err1 := b.Delete([]byte(ref))
-		var opts []leases.DeleteOpt
-		if sync {
-			opts = append(opts, leases.SynchronousDelete)
-		}
-		err2 := h.hLeaseManager.Delete(context.TODO(), leases.Lease{ID: h.leaseID(ref)}, opts...)
+		err2 := h.hLeaseManager.Delete(context.TODO(), leases.Lease{ID: h.leaseID(ref)})
 		if err1 != nil {
 			return err1
 		}
 		return err2
 	}); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return true, nil
 }
 
 func (h *HistoryQueue) init() error {
@@ -363,13 +442,13 @@ func (h *HistoryQueue) addResource(ctx context.Context, l leases.Lease, desc *co
 	if desc == nil {
 		return nil
 	}
-	if _, err := h.hContentStore.Info(ctx, desc.Digest); err != nil {
-		if errdefs.IsNotFound(err) {
-			ctx, release, err := leaseutil.WithLease(ctx, h.hLeaseManager, leases.WithID("history_migration_"+identity.NewID()), leaseutil.MakeTemporary)
+	if _, err := h.hContentStore.Info(ctx, digest.Digest(desc.Digest)); err != nil {
+		if cerrdefs.IsNotFound(err) {
+			lr, ctx, err := leaseutil.NewLease(ctx, h.hLeaseManager, leases.WithID("history_migration_"+identity.NewID()), leaseutil.MakeTemporary)
 			if err != nil {
 				return err
 			}
-			defer release(ctx)
+			defer lr.Discard()
 			ok, err := h.migrateBlobV2(ctx, string(desc.Digest), detectSkipLayers)
 			if err != nil {
 				return err
@@ -400,7 +479,7 @@ func (h *HistoryQueue) UpdateRef(ctx context.Context, ref string, upt func(r *co
 			return errors.Wrapf(os.ErrNotExist, "failed to retrieve ref %s", ref)
 		}
 
-		if err := br.Unmarshal(dt); err != nil {
+		if err := br.UnmarshalVT(dt); err != nil {
 			return errors.Wrapf(err, "failed to unmarshal build record %s", ref)
 		}
 		return nil
@@ -417,7 +496,7 @@ func (h *HistoryQueue) UpdateRef(ctx context.Context, ref string, upt func(r *co
 		return errors.Errorf("invalid ref change")
 	}
 
-	if err := h.update(ctx, br); err != nil {
+	if err := h.update(ctx, &br); err != nil {
 		return err
 	}
 	h.ps.Send(&controlapi.BuildHistoryEvent{
@@ -440,7 +519,7 @@ func (h *HistoryQueue) Status(ctx context.Context, ref string, st chan<- *client
 			return errors.Wrapf(os.ErrNotExist, "failed to retrieve ref %s", ref)
 		}
 
-		if err := br.Unmarshal(dt); err != nil {
+		if err := br.UnmarshalVT(dt); err != nil {
 			return errors.Wrapf(err, "failed to unmarshal build record %s", ref)
 		}
 		return nil
@@ -453,16 +532,18 @@ func (h *HistoryQueue) Status(ctx context.Context, ref string, st chan<- *client
 	}
 
 	ra, err := h.hContentStore.ReaderAt(ctx, ocispecs.Descriptor{
-		Digest:    br.Logs.Digest,
-		Size:      br.Logs.Size_,
+		Digest:    digest.Digest(br.Logs.Digest),
+		Size:      br.Logs.Size,
 		MediaType: br.Logs.MediaType,
 	})
 	if err != nil {
 		return err
 	}
-	defer ra.Close()
 
-	brdr := bufio.NewReader(&reader{ReaderAt: ra})
+	rc := iohelper.ReadCloser(ra)
+	defer rc.Close()
+
+	brdr := bufio.NewReader(rc)
 
 	buf := make([]byte, 32*1024)
 
@@ -483,7 +564,7 @@ func (h *HistoryQueue) Status(ctx context.Context, ref string, st chan<- *client
 			return err
 		}
 		var sr controlapi.StatusResponse
-		if err := sr.Unmarshal(buf[:sz]); err != nil {
+		if err := sr.UnmarshalVT(buf[:sz]); err != nil {
 			return err
 		}
 		st <- client.NewSolveStatus(&sr)
@@ -492,13 +573,13 @@ func (h *HistoryQueue) Status(ctx context.Context, ref string, st chan<- *client
 	return nil
 }
 
-func (h *HistoryQueue) update(ctx context.Context, rec controlapi.BuildHistoryRecord) error {
+func (h *HistoryQueue) update(ctx context.Context, rec *controlapi.BuildHistoryRecord) error {
 	return h.opt.DB.Update(func(tx *bolt.Tx) (err error) {
 		b := tx.Bucket([]byte(recordsBucket))
 		if b == nil {
 			return nil
 		}
-		dt, err := rec.Marshal()
+		dt, err := rec.MarshalVT()
 		if err != nil {
 			return err
 		}
@@ -506,7 +587,7 @@ func (h *HistoryQueue) update(ctx context.Context, rec controlapi.BuildHistoryRe
 		l, err := h.hLeaseManager.Create(ctx, leases.WithID(h.leaseID(rec.Ref)))
 		created := true
 		if err != nil {
-			if !errors.Is(err, errdefs.ErrAlreadyExists) {
+			if !errors.Is(err, cerrdefs.ErrAlreadyExists) {
 				return err
 			}
 			l = leases.Lease{ID: h.leaseID(rec.Ref)}
@@ -515,7 +596,7 @@ func (h *HistoryQueue) update(ctx context.Context, rec controlapi.BuildHistoryRe
 
 		defer func() {
 			if err != nil && created {
-				h.hLeaseManager.Delete(ctx, l)
+				h.hLeaseManager.Delete(context.WithoutCancel(ctx), l)
 			}
 		}()
 
@@ -523,6 +604,9 @@ func (h *HistoryQueue) update(ctx context.Context, rec controlapi.BuildHistoryRe
 			return err
 		}
 		if err := h.addResource(ctx, l, rec.Trace, false); err != nil {
+			return err
+		}
+		if err := h.addResource(ctx, l, rec.ExternalError, false); err != nil {
 			return err
 		}
 		if rec.Result != nil {
@@ -560,10 +644,54 @@ func (h *HistoryQueue) update(ctx context.Context, rec controlapi.BuildHistoryRe
 	})
 }
 
+func (h *HistoryQueue) AcquireFinalizer(ref string) (<-chan struct{}, func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	trigger := make(chan struct{})
+	f := &finalizer{
+		trigger: sync.OnceFunc(func() {
+			close(trigger)
+		}),
+		done: make(chan struct{}),
+	}
+	h.finalizers[ref] = f
+	go func() {
+		<-f.done
+		h.mu.Lock()
+		delete(h.finalizers, ref)
+		// if gracefulstop then release listeners after finalize
+		if len(h.finalizers) == 0 {
+			select {
+			case <-h.opt.GracefulStop:
+				go h.ps.Close()
+			default:
+			}
+		}
+		h.mu.Unlock()
+	}()
+	return trigger, sync.OnceFunc(func() {
+		close(f.done)
+	})
+}
+
+func (h *HistoryQueue) Finalize(ctx context.Context, ref string) error {
+	h.mu.Lock()
+	f, ok := h.finalizers[ref]
+	h.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	f.trigger()
+	<-f.done
+	return nil
+}
+
 func (h *HistoryQueue) Update(ctx context.Context, e *controlapi.BuildHistoryEvent) error {
 	h.init()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	e = e.CloneVT()
 
 	if e.Type == controlapi.BuildHistoryEventType_STARTED {
 		h.active[e.Record.Ref] = e.Record
@@ -572,7 +700,7 @@ func (h *HistoryQueue) Update(ctx context.Context, e *controlapi.BuildHistoryEve
 
 	if e.Type == controlapi.BuildHistoryEventType_COMPLETE {
 		delete(h.active, e.Record.Ref)
-		if err := h.update(ctx, *e.Record); err != nil {
+		if err := h.update(ctx, e.Record); err != nil {
 			return err
 		}
 		h.ps.Send(e)
@@ -584,7 +712,14 @@ func (h *HistoryQueue) Delete(ctx context.Context, ref string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	return h.delete(ref, true)
+	v, err := h.delete(ref)
+	if err != nil {
+		return err
+	}
+	if v {
+		return h.opt.GarbageCollect(ctx)
+	}
+	return nil
 }
 
 func (h *HistoryQueue) OpenBlobWriter(ctx context.Context, mt string) (_ *Writer, err error) {
@@ -595,7 +730,7 @@ func (h *HistoryQueue) OpenBlobWriter(ctx context.Context, mt string) (_ *Writer
 
 	defer func() {
 		if err != nil {
-			h.hLeaseManager.Delete(ctx, l)
+			h.hLeaseManager.Delete(context.WithoutCancel(ctx), l)
 		}
 	}()
 
@@ -642,7 +777,7 @@ func (w *Writer) Commit(ctx context.Context) (*ocispecs.Descriptor, func(), erro
 	dgst := w.dgstr.Digest()
 	sz := int64(w.sz)
 	if err := w.w.Commit(leases.WithLease(ctx, w.l.ID), int64(w.sz), dgst); err != nil {
-		if !errdefs.IsAlreadyExists(err) {
+		if !cerrdefs.IsAlreadyExists(err) {
 			w.Discard()
 			return nil, nil, err
 		}
@@ -655,6 +790,48 @@ func (w *Writer) Commit(ctx context.Context) (*ocispecs.Descriptor, func(), erro
 		func() {
 			w.lm.Delete(context.TODO(), w.l)
 		}, nil
+}
+
+func (h *HistoryQueue) ImportError(ctx context.Context, err error) (_ *spb.Status, _ *controlapi.Descriptor, _ func(), retErr error) {
+	st, ok := grpcerrors.AsGRPCStatus(grpcerrors.ToGRPC(ctx, err))
+	if !ok {
+		st = status.New(codes.Unknown, err.Error())
+	}
+
+	stpb := st.Proto()
+	dt, err := proto.Marshal(stpb)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	w, err := h.OpenBlobWriter(ctx, "application/vnd.googeapis.google.rpc.status+proto")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	defer func() {
+		if retErr != nil {
+			w.Discard()
+		}
+	}()
+
+	if _, err := w.Write(dt); err != nil {
+		return nil, nil, nil, err
+	}
+
+	desc, release, err := w.Commit(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// clear details part of the error that are saved to main record
+	stpb.Details = nil
+
+	return stpb, &controlapi.Descriptor{
+		Digest:    string(desc.Digest),
+		Size:      desc.Size,
+		MediaType: desc.MediaType,
+	}, release, nil
 }
 
 func (h *HistoryQueue) ImportStatus(ctx context.Context, ch chan *client.SolveStatus) (_ *StatusImportResult, _ func(), err error) {
@@ -684,9 +861,11 @@ func (h *HistoryQueue) ImportStatus(ctx context.Context, ch chan *client.SolveSt
 		completed bool
 	}
 	vtxMap := make(map[digest.Digest]*vtxInfo)
+	var numWarnings int
 
 	buf := make([]byte, 32*1024)
 	for st := range ch {
+		numWarnings += len(st.Warnings)
 		for _, vtx := range st.Vertexes {
 			if _, ok := vtxMap[vtx.Digest]; !ok {
 				vtxMap[vtx.Digest] = &vtxInfo{}
@@ -701,11 +880,11 @@ func (h *HistoryQueue) ImportStatus(ctx context.Context, ch chan *client.SolveSt
 
 		hdr := make([]byte, 4)
 		for _, pst := range st.Marshal() {
-			sz := pst.Size()
+			sz := pst.SizeVT()
 			if len(buf) < sz {
 				buf = make([]byte, sz)
 			}
-			n, err := pst.MarshalTo(buf)
+			n, err := pst.MarshalToVT(buf)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -742,6 +921,7 @@ func (h *HistoryQueue) ImportStatus(ctx context.Context, ch chan *client.SolveSt
 		NumCachedSteps:    numCached,
 		NumCompletedSteps: numCompleted,
 		NumTotalSteps:     len(vtxMap),
+		NumWarnings:       numWarnings,
 	}, release, nil
 }
 
@@ -765,7 +945,7 @@ func (h *HistoryQueue) Listen(ctx context.Context, req *controlapi.BuildHistoryR
 			if _, ok := h.deleted[req.Ref]; ok {
 				if h.refs[req.Ref] == 0 {
 					delete(h.refs, req.Ref)
-					h.delete(req.Ref, false)
+					h.delete(req.Ref)
 				}
 			}
 			h.mu.Unlock()
@@ -808,7 +988,7 @@ func (h *HistoryQueue) Listen(ctx context.Context, req *controlapi.BuildHistoryR
 					return nil
 				}
 				var br controlapi.BuildHistoryRecord
-				if err := br.Unmarshal(dt); err != nil {
+				if err := br.UnmarshalVT(dt); err != nil {
 					return errors.Wrapf(err, "failed to unmarshal build record %s", key)
 				}
 				events = append(events, &controlapi.BuildHistoryEvent{
@@ -828,6 +1008,12 @@ func (h *HistoryQueue) Listen(ctx context.Context, req *controlapi.BuildHistoryR
 			}
 		}
 		h.mu.Unlock()
+
+		events, err := filterHistoryEvents(events, req.Filter, req.Limit)
+		if err != nil {
+			return err
+		}
+
 		for _, e := range events {
 			if e == nil || e.Record == nil {
 				continue
@@ -859,6 +1045,207 @@ func (h *HistoryQueue) Listen(ctx context.Context, req *controlapi.BuildHistoryR
 	}
 }
 
+func filterHistoryEvents(in []*controlapi.BuildHistoryEvent, filters []string, limit int32) ([]*controlapi.BuildHistoryEvent, error) {
+	f, err := parseFilters(filters)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]*controlapi.BuildHistoryEvent, 0, len(in))
+
+	if len(f) == 0 {
+		out = in
+	} else {
+	loop0:
+		for _, ev := range in {
+			for _, fn := range f {
+				if fn(ev) {
+					out = append(out, ev)
+					continue loop0
+				}
+			}
+		}
+	}
+
+	if limit != 0 {
+		if limit < 0 {
+			return nil, errors.Errorf("invalid limit %d", limit)
+		}
+		slices.SortFunc(out, func(a, b *controlapi.BuildHistoryEvent) int {
+			if a.Record == nil || b.Record == nil {
+				return 0
+			}
+			if a.Record == nil {
+				return 1
+			}
+			return b.Record.CreatedAt.AsTime().Compare(a.Record.CreatedAt.AsTime())
+		})
+		if int32(len(out)) > limit {
+			out = out[:limit]
+		}
+	}
+	return out, nil
+}
+
+func parseFilters(in []string) ([]func(*controlapi.BuildHistoryEvent) bool, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+
+	var out []func(*controlapi.BuildHistoryEvent) bool
+	for _, in := range in {
+		fns, err := parseFilter(in)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, func(ev *controlapi.BuildHistoryEvent) bool {
+			for _, fn := range fns {
+				if !fn(ev) {
+					return false
+				}
+			}
+			return true
+		})
+	}
+	return out, nil
+}
+
+func timeBasedFilter(f string) (func(*controlapi.BuildHistoryEvent) bool, error) {
+	key, sep, value, _ := cutAny(f, []string{">=", "<=", ">", "<"})
+	var cmp int64
+	switch key {
+	case "startedAt", "completedAt":
+		v, err := time.ParseDuration(value)
+		if err == nil {
+			tm := time.Now().Add(-v)
+			cmp = tm.Unix()
+		} else {
+			tm, err := time.Parse(time.RFC3339, value)
+			if err != nil {
+				return nil, errors.Errorf("invalid time %s", value)
+			}
+			cmp = tm.Unix()
+		}
+	case "duration":
+		v, err := time.ParseDuration(value)
+		if err != nil {
+			return nil, errors.Errorf("invalid duration %s", value)
+		}
+		cmp = int64(v)
+	default:
+		return nil, nil
+	}
+
+	return func(ev *controlapi.BuildHistoryEvent) bool {
+		if ev.Record == nil {
+			return false
+		}
+		var val int64
+		switch key {
+		case "startedAt":
+			val = ev.Record.CreatedAt.AsTime().Unix()
+		case "completedAt":
+			if ev.Record.CompletedAt != nil {
+				val = ev.Record.CompletedAt.AsTime().Unix()
+			}
+		case "duration":
+			if ev.Record.CompletedAt != nil {
+				val = int64(ev.Record.CompletedAt.AsTime().Sub(ev.Record.CreatedAt.AsTime()))
+			}
+		}
+		switch sep {
+		case ">=":
+			return val >= cmp
+		case "<=":
+			return val <= cmp
+		case ">":
+			return val > cmp
+		default:
+			return val < cmp
+		}
+	}, nil
+}
+
+func parseFilter(in string) ([]func(*controlapi.BuildHistoryEvent) bool, error) {
+	var out []func(*controlapi.BuildHistoryEvent) bool
+
+	fields, err := csvvalue.Fields(in, nil)
+	if err != nil {
+		return nil, err
+	}
+	var staticFilters []string
+
+	for _, f := range fields {
+		fn, err := timeBasedFilter(f)
+		if err != nil {
+			return nil, err
+		}
+		if fn == nil {
+			staticFilters = append(staticFilters, f)
+			continue
+		}
+		out = append(out, fn)
+	}
+
+	filter, err := filters.ParseAll(strings.Join(staticFilters, ","))
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to parse history filters %v", in)
+	}
+
+	out = append(out, func(ev *controlapi.BuildHistoryEvent) bool {
+		if ev.Record == nil {
+			return false
+		}
+		return filter.Match(adaptHistoryRecord(ev.Record))
+	})
+	return out, nil
+}
+
+func adaptHistoryRecord(rec *controlapi.BuildHistoryRecord) filters.Adaptor {
+	return filters.AdapterFunc(func(fieldpath []string) (string, bool) {
+		if len(fieldpath) == 0 {
+			return "", false
+		}
+
+		switch fieldpath[0] {
+		case "ref":
+			return rec.Ref, rec.Ref != ""
+		case "status":
+			if rec.CompletedAt != nil {
+				if rec.Error != nil {
+					if strings.Contains(rec.Error.Message, "context canceled") {
+						return statusCanceled, true
+					}
+					return statusError, true
+				}
+				return statusCompleted, true
+			}
+			return statusRunning, true
+		case "repository":
+			v, ok := rec.FrontendAttrs["vcs:source"]
+			if ok {
+				return v, true
+			}
+			if context, ok := rec.FrontendAttrs["context"]; ok {
+				if ref, err := gitutil.ParseGitRef(context); err == nil {
+					return ref.Remote, true
+				}
+			}
+			return "", false
+		}
+		return "", false
+	})
+}
+
+func cutAny(in string, opt []string) (before string, sep string, after string, found bool) {
+	for _, s := range opt {
+		if i := strings.Index(in, s); i >= 0 {
+			return in[:i], s, in[i+len(s):], true
+		}
+	}
+	return "", "", "", false
+}
+
 type pubsub[T any] struct {
 	mu sync.Mutex
 	m  map[*channel[T]]struct{}
@@ -884,6 +1271,18 @@ func (p *pubsub[T]) Send(v T) {
 	p.mu.Unlock()
 }
 
+func (p *pubsub[T]) Close() {
+	p.mu.Lock()
+	channels := make([]*channel[T], 0, len(p.m))
+	for c := range p.m {
+		channels = append(channels, c)
+	}
+	p.mu.Unlock()
+	for _, c := range channels {
+		c.close()
+	}
+}
+
 type channel[T any] struct {
 	ps        *pubsub[T]
 	ch        chan T
@@ -905,15 +1304,4 @@ func (p *channel[T]) close() {
 		p.ps.mu.Unlock()
 		close(p.done)
 	})
-}
-
-type reader struct {
-	io.ReaderAt
-	pos int64
-}
-
-func (r *reader) Read(p []byte) (int, error) {
-	n, err := r.ReaderAt.ReadAt(p, r.pos)
-	r.pos += int64(len(p))
-	return n, err
 }

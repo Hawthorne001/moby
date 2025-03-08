@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker/testutil/fakecontext"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
 )
 
@@ -63,7 +64,7 @@ func TestBuildSquashParent(t *testing.T) {
 	resp.Body.Close()
 	assert.NilError(t, err)
 
-	inspect, _, err := client.ImageInspectWithRaw(ctx, name)
+	inspect, err := client.ImageInspect(ctx, name)
 	assert.NilError(t, err)
 	origID := inspect.ID
 
@@ -85,6 +86,8 @@ func TestBuildSquashParent(t *testing.T) {
 		container.WithImage(name),
 		container.WithCmd("/bin/sh", "-c", "cat /hello"),
 	)
+
+	poll.WaitOn(t, container.IsStopped(ctx, client, cid))
 	reader, err := client.ContainerLogs(ctx, cid, containertypes.LogsOptions{
 		ShowStdout: true,
 	})
@@ -110,7 +113,7 @@ func TestBuildSquashParent(t *testing.T) {
 	testHistory, err := client.ImageHistory(ctx, name)
 	assert.NilError(t, err)
 
-	inspect, _, err = client.ImageInspectWithRaw(ctx, name)
+	inspect, err = client.ImageInspect(ctx, name)
 	assert.NilError(t, err)
 	assert.Check(t, is.Len(testHistory, len(origHistory)+1))
 	assert.Check(t, is.Len(inspect.RootFS.Layers, 2))

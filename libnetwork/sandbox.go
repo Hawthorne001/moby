@@ -1,3 +1,6 @@
+// FIXME(thaJeztah): remove once we are a module; the go:build directive prevents go from downgrading language version to go1.16:
+//go:build go1.22
+
 package libnetwork
 
 import (
@@ -5,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -67,13 +71,6 @@ type hostsPathConfig struct {
 	hostsPath       string
 	originHostsPath string
 	extraHosts      []extraHost
-	parentUpdates   []parentUpdate
-}
-
-type parentUpdate struct {
-	cid  string
-	name string
-	ip   string
 }
 
 type extraHost struct {
@@ -130,11 +127,11 @@ func (sb *Sandbox) Labels() map[string]interface{} {
 }
 
 // Delete destroys this container after detaching it from all connected endpoints.
-func (sb *Sandbox) Delete() error {
-	return sb.delete(false)
+func (sb *Sandbox) Delete(ctx context.Context) error {
+	return sb.delete(ctx, false)
 }
 
-func (sb *Sandbox) delete(force bool) error {
+func (sb *Sandbox) delete(ctx context.Context, force bool) error {
 	sb.mu.Lock()
 	if sb.inDelete {
 		sb.mu.Unlock()
@@ -160,23 +157,23 @@ func (sb *Sandbox) delete(force bool) error {
 		if ep.endpointInGWNetwork() && !force {
 			continue
 		}
-		// Retain the sanbdox if we can't obtain the network from store.
+		// Retain the sandbox if we can't obtain the network from store.
 		if _, err := c.getNetworkFromStore(ep.getNetwork().ID()); err != nil {
 			if !c.isSwarmNode() {
 				retain = true
 			}
-			log.G(context.TODO()).Warnf("Failed getting network for ep %s during sandbox %s delete: %v", ep.ID(), sb.ID(), err)
+			log.G(ctx).Warnf("Failed getting network for ep %s during sandbox %s delete: %v", ep.ID(), sb.ID(), err)
 			continue
 		}
 
 		if !force {
-			if err := ep.Leave(sb); err != nil {
-				log.G(context.TODO()).Warnf("Failed detaching sandbox %s from endpoint %s: %v\n", sb.ID(), ep.ID(), err)
+			if err := ep.Leave(context.WithoutCancel(ctx), sb); err != nil {
+				log.G(ctx).Warnf("Failed detaching sandbox %s from endpoint %s: %v\n", sb.ID(), ep.ID(), err)
 			}
 		}
 
-		if err := ep.Delete(force); err != nil {
-			log.G(context.TODO()).Warnf("Failed deleting endpoint %s: %v\n", ep.ID(), err)
+		if err := ep.Delete(context.WithoutCancel(ctx), force); err != nil {
+			log.G(ctx).Warnf("Failed deleting endpoint %s: %v\n", ep.ID(), err)
 		}
 	}
 
@@ -196,12 +193,12 @@ func (sb *Sandbox) delete(force bool) error {
 
 	if sb.osSbox != nil && !sb.config.useDefaultSandBox {
 		if err := sb.osSbox.Destroy(); err != nil {
-			log.G(context.TODO()).WithError(err).Warn("error destroying network sandbox")
+			log.G(ctx).WithError(err).Warn("error destroying network sandbox")
 		}
 	}
 
 	if err := sb.storeDelete(); err != nil {
-		log.G(context.TODO()).Warnf("Failed to delete sandbox %s from store: %v", sb.ID(), err)
+		log.G(ctx).Warnf("Failed to delete sandbox %s from store: %v", sb.ID(), err)
 	}
 
 	c.mu.Lock()
@@ -243,14 +240,14 @@ func (sb *Sandbox) Rename(name string) error {
 
 // Refresh leaves all the endpoints, resets and re-applies the options,
 // re-joins all the endpoints without destroying the osl sandbox
-func (sb *Sandbox) Refresh(options ...SandboxOption) error {
+func (sb *Sandbox) Refresh(ctx context.Context, options ...SandboxOption) error {
 	// Store connected endpoints
 	epList := sb.Endpoints()
 
 	// Detach from all endpoints
 	for _, ep := range epList {
-		if err := ep.Leave(sb); err != nil {
-			log.G(context.TODO()).Warnf("Failed detaching sandbox %s from endpoint %s: %v\n", sb.ID(), ep.ID(), err)
+		if err := ep.Leave(context.WithoutCancel(ctx), sb); err != nil {
+			log.G(ctx).Warnf("Failed detaching sandbox %s from endpoint %s: %v\n", sb.ID(), ep.ID(), err)
 		}
 	}
 
@@ -259,18 +256,27 @@ func (sb *Sandbox) Refresh(options ...SandboxOption) error {
 	sb.processOptions(options...)
 
 	// Setup discovery files
-	if err := sb.setupResolutionFiles(); err != nil {
+	if err := sb.setupResolutionFiles(ctx); err != nil {
 		return err
 	}
 
 	// Re-connect to all endpoints
 	for _, ep := range epList {
-		if err := ep.Join(sb); err != nil {
-			log.G(context.TODO()).Warnf("Failed attach sandbox %s to endpoint %s: %v\n", sb.ID(), ep.ID(), err)
+		if err := ep.Join(context.WithoutCancel(ctx), sb); err != nil {
+			log.G(ctx).Warnf("Failed attach sandbox %s to endpoint %s: %v\n", sb.ID(), ep.ID(), err)
 		}
 	}
 
 	return nil
+}
+
+func (sb *Sandbox) UpdateLabels(labels map[string]interface{}) {
+	if sb.config.generic == nil {
+		sb.config.generic = make(map[string]interface{}, len(labels))
+	}
+	for k, v := range labels {
+		sb.config.generic[k] = v
+	}
 }
 
 func (sb *Sandbox) MarshalJSON() ([]byte, error) {
@@ -438,27 +444,18 @@ func (sb *Sandbox) ResolveName(ctx context.Context, name string, ipType int) ([]
 
 	for i := 0; i < len(reqName); i++ {
 		// First check for local container alias
-		ip, ipv6Miss := sb.resolveName(ctx, reqName[i], networkName[i], epList, true, ipType)
-		if ip != nil {
-			return ip, false
+		if ip, ok := sb.resolveName(ctx, reqName[i], networkName[i], epList, true, ipType); ok {
+			return ip, true
 		}
-		if ipv6Miss {
-			return ip, ipv6Miss
-		}
-
 		// Resolve the actual container name
-		ip, ipv6Miss = sb.resolveName(ctx, reqName[i], networkName[i], epList, false, ipType)
-		if ip != nil {
-			return ip, false
-		}
-		if ipv6Miss {
-			return ip, ipv6Miss
+		if ip, ok := sb.resolveName(ctx, reqName[i], networkName[i], epList, false, ipType); ok {
+			return ip, true
 		}
 	}
 	return nil, false
 }
 
-func (sb *Sandbox) resolveName(ctx context.Context, nameOrAlias string, networkName string, epList []*Endpoint, lookupAlias bool, ipType int) (_ []net.IP, ipv6Miss bool) {
+func (sb *Sandbox) resolveName(ctx context.Context, nameOrAlias string, networkName string, epList []*Endpoint, lookupAlias bool, ipType int) ([]net.IP, bool) {
 	ctx, span := otel.Tracer("").Start(ctx, "Sandbox.resolveName", trace.WithAttributes(
 		attribute.String("libnet.resolver.name-or-alias", nameOrAlias),
 		attribute.String("libnet.network.name", networkName),
@@ -496,15 +493,27 @@ func (sb *Sandbox) resolveName(ctx context.Context, nameOrAlias string, networkN
 			}
 		}
 
-		ip, miss := nw.ResolveName(ctx, name, ipType)
-		if ip != nil {
-			return ip, false
-		}
-		if miss {
-			ipv6Miss = miss
+		ip, ok := nw.ResolveName(ctx, name, ipType)
+		if ok {
+			return ip, true
 		}
 	}
-	return nil, ipv6Miss
+	return nil, false
+}
+
+// hasExternalAccess returns true if any of sb's Endpoints appear to have external
+// network access.
+func (sb *Sandbox) hasExternalAccess() bool {
+	for _, ep := range sb.Endpoints() {
+		nw := ep.getNetwork()
+		if nw.Internal() || nw.Type() == "null" || nw.Type() == "host" {
+			continue
+		}
+		if v4, v6 := ep.hasGatewayOrDefaultRoute(); v4 || v6 {
+			return true
+		}
+	}
+	return false
 }
 
 // EnableService makes a managed container's service available by adding the
@@ -579,41 +588,22 @@ func (sb *Sandbox) clearNetworkResources(origEp *Endpoint) error {
 		return nil
 	}
 
-	var (
-		gwepBefore, gwepAfter *Endpoint
-		index                 = -1
-	)
-	for i, e := range sb.endpoints {
-		if e == ep {
-			index = i
-		}
-		if len(e.Gateway()) > 0 && gwepBefore == nil {
-			gwepBefore = e
-		}
-		if index != -1 && gwepBefore != nil {
-			break
-		}
-	}
-
-	if index == -1 {
+	if !slices.Contains(sb.endpoints, ep) {
 		log.G(context.TODO()).Warnf("Endpoint %s has already been deleted", ep.Name())
 		sb.mu.Unlock()
 		return nil
 	}
 
+	gwepBefore4, gwepBefore6 := selectGatewayEndpoint(sb.endpoints)
 	sb.removeEndpointRaw(ep)
-	for _, e := range sb.endpoints {
-		if len(e.Gateway()) > 0 {
-			gwepAfter = e
-			break
-		}
-	}
+	gwepAfter4, gwepAfter6 := selectGatewayEndpoint(sb.endpoints)
 	delete(sb.epPriority, ep.ID())
+
 	sb.mu.Unlock()
 
-	if gwepAfter != nil && gwepBefore != gwepAfter {
-		if err := sb.updateGateway(gwepAfter); err != nil {
-			return err
+	if (gwepAfter4 != nil && gwepBefore4 != gwepAfter4) || (gwepAfter6 != nil && gwepBefore6 != gwepAfter6) {
+		if err := sb.updateGateway(gwepAfter4, gwepAfter6); err != nil {
+			return fmt.Errorf("updating gateway endpoint: %w", err)
 		}
 	}
 
@@ -622,7 +612,7 @@ func (sb *Sandbox) clearNetworkResources(origEp *Endpoint) error {
 	// not bother updating the store. The sandbox object will be
 	// deleted anyway
 	if !inDelete {
-		return sb.storeUpdate()
+		return sb.storeUpdate(context.TODO())
 	}
 
 	return nil
@@ -658,34 +648,35 @@ func (sb *Sandbox) joinLeaveEnd() {
 	}
 }
 
+// Less defines an ordering over endpoints, with better candidates for the default
+// gateway sorted first.
+//
 // <=> Returns true if a < b, false if a > b and advances to next level if a == b
 // epi.prio <=> epj.prio           # 2 < 1
 // epi.gw <=> epj.gw               # non-gw < gw
 // epi.internal <=> epj.internal   # non-internal < internal
-// epi.joininfo <=> epj.joininfo   # ipv6 < ipv4
+// epi.hasGw <=> epj.hasGw         # (gw4 and gw6) < (gw4 or gw6) < (no gw)
 // epi.name <=> epj.name           # bar < foo
 func (epi *Endpoint) Less(epj *Endpoint) bool {
-	var prioi, prioj int
-
 	sbi, _ := epi.getSandbox()
 	sbj, _ := epj.getSandbox()
 
 	// Prio defaults to 0
+	var prioi, prioj int
 	if sbi != nil {
 		prioi = sbi.epPriority[epi.ID()]
 	}
 	if sbj != nil {
 		prioj = sbj.epPriority[epj.ID()]
 	}
-
 	if prioi != prioj {
 		return prioi > prioj
 	}
 
-	gwi := epi.endpointInGWNetwork()
-	gwj := epj.endpointInGWNetwork()
-	if gwi != gwj {
-		return gwj
+	gwNeti := epi.endpointInGWNetwork()
+	gwNetj := epj.endpointInGWNetwork()
+	if gwNeti != gwNetj {
+		return gwNetj
 	}
 
 	inti := epi.getNetwork().Internal()
@@ -694,28 +685,20 @@ func (epi *Endpoint) Less(epj *Endpoint) bool {
 		return intj
 	}
 
-	jii := 0
-	if epi.joinInfo != nil {
-		if epi.joinInfo.gw != nil {
-			jii = jii + 1
+	gwCount := func(ep *Endpoint) int {
+		gw4, gw6 := ep.hasGatewayOrDefaultRoute()
+		if gw4 && gw6 {
+			return 2
 		}
-		if epi.joinInfo.gw6 != nil {
-			jii = jii + 2
+		if gw4 || gw6 {
+			return 1
 		}
+		return 0
 	}
-
-	jij := 0
-	if epj.joinInfo != nil {
-		if epj.joinInfo.gw != nil {
-			jij = jij + 1
-		}
-		if epj.joinInfo.gw6 != nil {
-			jij = jij + 2
-		}
-	}
-
-	if jii != jij {
-		return jii > jij
+	gwCounti := gwCount(epi)
+	gwCountj := gwCount(epj)
+	if gwCounti != gwCountj {
+		return gwCounti > gwCountj
 	}
 
 	return epi.network.Name() < epj.network.Name()

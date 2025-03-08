@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/testutil/daemon"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
+	"gotest.tools/v3/poll"
 	"gotest.tools/v3/skip"
 )
 
@@ -28,7 +29,7 @@ func TestCommitInheritsEnv(t *testing.T) {
 	})
 	assert.NilError(t, err)
 
-	image1, _, err := client.ImageInspectWithRaw(ctx, commitResp1.ID)
+	image1, err := client.ImageInspect(ctx, commitResp1.ID)
 	assert.NilError(t, err)
 
 	expectedEnv1 := []string{"PATH=/bin"}
@@ -42,7 +43,7 @@ func TestCommitInheritsEnv(t *testing.T) {
 	})
 	assert.NilError(t, err)
 
-	image2, _, err := client.ImageInspectWithRaw(ctx, commitResp2.ID)
+	image2, err := client.ImageInspect(ctx, commitResp2.ID)
 	assert.NilError(t, err)
 	expectedEnv2 := []string{"PATH=/usr/bin:/bin"}
 	assert.Check(t, is.DeepEqual(expectedEnv2, image2.Config.Env))
@@ -61,7 +62,8 @@ func TestUsernsCommit(t *testing.T) {
 	clientUserRemap := dUserRemap.NewClientT(t)
 	defer clientUserRemap.Close()
 
-	container.Run(ctx, t, clientUserRemap, container.WithName(t.Name()), container.WithImage("busybox"), container.WithCmd("sh", "-c", "echo hello world > /hello.txt && chown 1000:1000 /hello.txt"))
+	cID := container.Run(ctx, t, clientUserRemap, container.WithName(t.Name()), container.WithImage("busybox"), container.WithCmd("sh", "-c", "echo hello world > /hello.txt && chown 1000:1000 /hello.txt"))
+	poll.WaitOn(t, container.IsStopped(ctx, clientUserRemap, cID))
 	img, err := clientUserRemap.ContainerCommit(ctx, t.Name(), containertypes.CommitOptions{})
 	assert.NilError(t, err)
 

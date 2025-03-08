@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/errdefs"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -23,6 +23,15 @@ func TestNetworkDisconnectError(t *testing.T) {
 
 	err := client.NetworkDisconnect(context.Background(), "network_id", "container_id", false)
 	assert.Check(t, is.ErrorType(err, errdefs.IsSystem))
+
+	// Empty network ID or container ID
+	err = client.NetworkDisconnect(context.Background(), "", "container_id", false)
+	assert.Check(t, is.ErrorType(err, errdefs.IsInvalidParameter))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
+
+	err = client.NetworkDisconnect(context.Background(), "network_id", "", false)
+	assert.Check(t, is.ErrorType(err, errdefs.IsInvalidParameter))
+	assert.Check(t, is.ErrorContains(err, "value is empty"))
 }
 
 func TestNetworkDisconnect(t *testing.T) {
@@ -38,7 +47,7 @@ func TestNetworkDisconnect(t *testing.T) {
 				return nil, fmt.Errorf("expected POST method, got %s", req.Method)
 			}
 
-			var disconnect types.NetworkDisconnect
+			var disconnect network.DisconnectOptions
 			if err := json.NewDecoder(req.Body).Decode(&disconnect); err != nil {
 				return nil, err
 			}

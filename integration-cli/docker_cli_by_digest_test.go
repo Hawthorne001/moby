@@ -11,9 +11,10 @@ import (
 
 	"github.com/docker/distribution/manifest/schema1"
 	"github.com/docker/distribution/manifest/schema2"
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/integration-cli/cli"
 	"github.com/docker/docker/integration-cli/cli/build"
+	"github.com/docker/docker/internal/lazyregexp"
 	"github.com/opencontainers/go-digest"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -26,8 +27,8 @@ const (
 )
 
 var (
-	pushDigestRegex = regexp.MustCompile(`[\S]+: digest: ([\S]+) size: [0-9]+`)
-	digestRegex     = regexp.MustCompile(`Digest: ([\S]+)`)
+	pushDigestRegex = lazyregexp.New(`[\S]+: digest: ([\S]+) size: [0-9]+`)
+	digestRegex     = lazyregexp.New(`Digest: ([\S]+)`)
 )
 
 func setupImage(c *testing.T) (digest.Digest, error) {
@@ -412,7 +413,7 @@ func (s *DockerRegistrySuite) TestInspectImageWithDigests(c *testing.T) {
 
 	out := cli.DockerCmd(c, "inspect", imageReference).Stdout()
 
-	var imageJSON []types.ImageInspect
+	var imageJSON []image.InspectResponse
 	err = json.Unmarshal([]byte(out), &imageJSON)
 	assert.NilError(c, err)
 	assert.Equal(c, len(imageJSON), 1)
@@ -619,7 +620,7 @@ func (s *DockerSchema1RegistrySuite) TestPullFailsWithAlteredManifest(c *testing
 	assert.Assert(c, exitStatus != 0)
 
 	expectedErrorMsg := fmt.Sprintf("image verification failed for digest %s", manifestDigest)
-	assert.Assert(c, strings.Contains(out, expectedErrorMsg))
+	assert.Assert(c, is.Contains(out, expectedErrorMsg))
 }
 
 // TestPullFailsWithAlteredLayer tests that a `docker pull` fails when
@@ -630,14 +631,14 @@ func (s *DockerRegistrySuite) TestPullFailsWithAlteredLayer(c *testing.T) {
 	skip.If(c, testEnv.UsingSnapshotter(), "Faked layer is already in the content store, so it won't be fetched from the repository at all.")
 
 	manifestDigest, err := setupImage(c)
-	assert.Assert(c, err == nil)
+	assert.NilError(c, err)
 
 	// Load the target manifest blob.
 	manifestBlob := s.reg.ReadBlobContents(c, manifestDigest)
 
 	var imgManifest schema2.Manifest
 	err = json.Unmarshal(manifestBlob, &imgManifest)
-	assert.Assert(c, err == nil)
+	assert.NilError(c, err)
 
 	// Next, get the digest of one of the layers from the manifest.
 	targetLayerDigest := imgManifest.Layers[0].Digest
@@ -673,14 +674,14 @@ func (s *DockerRegistrySuite) TestPullFailsWithAlteredLayer(c *testing.T) {
 func (s *DockerSchema1RegistrySuite) TestPullFailsWithAlteredLayer(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
 	manifestDigest, err := setupImage(c)
-	assert.Assert(c, err == nil)
+	assert.NilError(c, err)
 
 	// Load the target manifest blob.
 	manifestBlob := s.reg.ReadBlobContents(c, manifestDigest)
 
 	var imgManifest schema1.Manifest
 	err = json.Unmarshal(manifestBlob, &imgManifest)
-	assert.Assert(c, err == nil)
+	assert.NilError(c, err)
 
 	// Next, get the digest of one of the layers from the manifest.
 	targetLayerDigest := imgManifest.FSLayers[0].BlobSum

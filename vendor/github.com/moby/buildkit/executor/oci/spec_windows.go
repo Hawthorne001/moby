@@ -1,5 +1,4 @@
 //go:build windows
-// +build windows
 
 package oci
 
@@ -10,11 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/mount"
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/core/containers"
+	"github.com/containerd/containerd/v2/core/mount"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/continuity/fs"
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
@@ -51,14 +51,14 @@ func withGetUserInfoMount() oci.SpecOpts {
 	}
 }
 
-func generateMountOpts(resolvConf, hostsFile string) ([]oci.SpecOpts, error) {
+func generateMountOpts(_, _ string) []oci.SpecOpts {
 	return []oci.SpecOpts{
 		withGetUserInfoMount(),
-	}, nil
+	}
 }
 
 // generateSecurityOpts may affect mounts, so must be called after generateMountOpts
-func generateSecurityOpts(mode pb.SecurityMode, apparmorProfile string, selinuxB bool) ([]oci.SpecOpts, error) {
+func generateSecurityOpts(mode pb.SecurityMode, _ string, _ bool) ([]oci.SpecOpts, error) {
 	if mode == pb.SecurityMode_INSECURE {
 		return nil, errors.New("no support for running in insecure mode on Windows")
 	}
@@ -110,4 +110,12 @@ func sub(m mount.Mount, subPath string) (mount.Mount, func() error, error) {
 	}
 	m.Source = src
 	return m, func() error { return nil }, nil
+}
+
+func generateCDIOpts(_ *cdidevices.Manager, devices []*pb.CDIDevice) ([]oci.SpecOpts, error) {
+	if len(devices) == 0 {
+		return nil, nil
+	}
+	// https://github.com/cncf-tags/container-device-interface/issues/28
+	return nil, errors.New("no support for CDI on Windows")
 }

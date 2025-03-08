@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 package containerdexecutor
 
@@ -8,9 +7,9 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/mount"
-	containerdoci "github.com/containerd/containerd/oci"
+	ctd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/mount"
+	containerdoci "github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/continuity/fs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/executor"
@@ -102,7 +101,7 @@ func (w *containerdExecutor) prepareExecutionEnv(ctx context.Context, rootMount 
 	return resolvConf, hostsFile, releaseAll, nil
 }
 
-func (w *containerdExecutor) ensureCWD(ctx context.Context, details *containerState, meta executor.Meta) error {
+func (w *containerdExecutor) ensureCWD(_ context.Context, details *containerState, meta executor.Meta) error {
 	newp, err := fs.RootPath(details.rootfsPath, meta.Cwd)
 	if err != nil {
 		return errors.Wrapf(err, "working dir %s points to invalid target", newp)
@@ -146,7 +145,7 @@ func (w *containerdExecutor) createOCISpec(ctx context.Context, id, resolvConf, 
 	}
 
 	processMode := oci.ProcessSandbox // FIXME(AkihiroSuda)
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.cgroupParent, processMode, nil, w.apparmorProfile, w.selinux, w.traceSocket, opts...)
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.cgroupParent, processMode, nil, w.apparmorProfile, w.selinux, w.traceSocket, w.cdiManager, opts...)
 	if err != nil {
 		releaseAll()
 		return nil, nil, err
@@ -162,20 +161,20 @@ func (w *containerdExecutor) createOCISpec(ctx context.Context, id, resolvConf, 
 	return spec, releaseAll, nil
 }
 
-func (d *containerState) getTaskOpts() ([]containerd.NewTaskOpts, error) {
-	rootfs := containerd.WithRootFS([]mount.Mount{{
+func (d *containerState) getTaskOpts() ([]ctd.NewTaskOpts, error) {
+	rootfs := ctd.WithRootFS([]mount.Mount{{
 		Source:  d.rootfsPath,
 		Type:    "bind",
 		Options: []string{"rbind"},
 	}})
 	if runtime.GOOS == "freebsd" {
-		rootfs = containerd.WithRootFS([]mount.Mount{{
+		rootfs = ctd.WithRootFS([]mount.Mount{{
 			Source:  d.rootfsPath,
 			Type:    "nullfs",
 			Options: []string{},
 		}})
 	}
-	return []containerd.NewTaskOpts{rootfs}, nil
+	return []ctd.NewTaskOpts{rootfs}, nil
 }
 
 func setArgs(spec *specs.Process, args []string) {
