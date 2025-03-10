@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/log"
 	"github.com/docker/docker/api/types/backend"
 	containertypes "github.com/docker/docker/api/types/container"
@@ -24,6 +25,12 @@ import (
 // if it returns nil, the config channel will be active and return log
 // messages until it runs out or the context is canceled.
 func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, config *containertypes.LogsOptions) (messages <-chan *backend.LogMessage, isTTY bool, retErr error) {
+	ctx, span := tracing.StartSpan(ctx, "daemon.ContainerLogs")
+	defer func() {
+		span.SetStatus(retErr)
+		span.End()
+	}()
+
 	lg := log.G(ctx).WithFields(log.Fields{
 		"module":    "daemon",
 		"method":    "(*Daemon).ContainerLogs",
@@ -96,7 +103,7 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 		Follow: follow,
 	}
 
-	logs := logReader.ReadLogs(readConfig)
+	logs := logReader.ReadLogs(ctx, readConfig)
 
 	// past this point, we can't possibly return any errors, so we can just
 	// start a goroutine and return to tell the caller not to expect errors
@@ -160,17 +167,25 @@ func (daemon *Daemon) ContainerLogs(ctx context.Context, containerName string, c
 	return messageChan, ctr.Config.Tty, nil
 }
 
-func (daemon *Daemon) getLogger(container *container.Container) (l logger.Logger, created bool, err error) {
+func (daemon *Daemon) getLogger(container *container.Container) (_ logger.Logger, created bool, _ error) {
+	var logDriver logger.Logger
 	container.Lock()
 	if container.State.Running {
-		l = container.LogDriver
+		logDriver = container.LogDriver
 	}
 	container.Unlock()
-	if l == nil {
-		created = true
-		l, err = container.StartLogger()
+	if logDriver != nil {
+		return logDriver, false, nil
 	}
-	return
+	logDriver, err := container.StartLogger()
+	if err != nil {
+		// Let's assume a driver was created, but failed to start;
+		// see https://github.com/moby/moby/pull/49493#discussion_r1979120968
+		//
+		// TODO(thaJeztah): check if we're not leaking resources if a logger was created, but failed to start.
+		return nil, true, err
+	}
+	return logDriver, true, nil
 }
 
 // mergeAndVerifyLogConfig merges the daemon log config to the container's log config if the container's log driver is not specified.

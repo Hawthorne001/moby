@@ -15,16 +15,7 @@ import (
 	"github.com/ishidawataru/sctp"
 )
 
-const (
-	maxAllocatePortAttempts = 10
-)
-
-// ErrUnsupportedAddressType is returned when the specified address type is not supported.
-type ErrUnsupportedAddressType string
-
-func (uat ErrUnsupportedAddressType) Error() string {
-	return fmt.Sprintf("unsupported address type: %s", string(uat))
-}
+const maxAllocatePortAttempts = 10
 
 // AllocatePorts allocates ports specified in bindings from the portMapper
 func AllocatePorts(portMapper *portmapper.PortMapper, bindings []types.PortBinding, containerIP net.IP) ([]types.PortBinding, error) {
@@ -71,7 +62,7 @@ func allocatePort(portMapper *portmapper.PortMapper, bnd *types.PortBinding, con
 
 	// Try up to maxAllocatePortAttempts times to get a port that's not already allocated.
 	for i := 0; i < maxAllocatePortAttempts; i++ {
-		if host, err = portMapper.MapRange(container, bnd.HostIP, int(bnd.HostPort), int(bnd.HostPortEnd), false); err == nil {
+		if host, err = portMapper.MapRange(container, bnd.HostIP, int(bnd.HostPort), int(bnd.HostPortEnd)); err == nil {
 			break
 		}
 		// There is no point in immediately retrying to map an explicitly chosen port.
@@ -98,7 +89,7 @@ func allocatePort(portMapper *portmapper.PortMapper, bnd *types.PortBinding, con
 		break
 	default:
 		// For completeness
-		return ErrUnsupportedAddressType(fmt.Sprintf("%T", netAddr))
+		return fmt.Errorf("unsupported address type: %T", netAddr)
 	}
 	// Windows does not support host port ranges.
 	bnd.HostPortEnd = bnd.HostPort

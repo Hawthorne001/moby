@@ -12,12 +12,13 @@ import (
 	"time"
 
 	"github.com/creack/pty"
-	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/integration-cli/cli"
 	"github.com/docker/docker/testutil"
 	"github.com/docker/docker/testutil/request"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 )
 
 func (s *DockerCLIUpdateSuite) TearDownTest(ctx context.Context, c *testing.T) {
@@ -118,7 +119,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateContainerInvalidValue(c *testing.T) {
 	out, _, err := dockerCmdWithError("update", "-m", "2M", name)
 	assert.ErrorContains(c, err, "")
 	expected := "Minimum memory limit allowed is 6MB"
-	assert.Assert(c, strings.Contains(out, expected))
+	assert.Assert(c, is.Contains(out, expected))
 }
 
 func (s *DockerCLIUpdateSuite) TestUpdateContainerWithoutFlags(c *testing.T) {
@@ -185,7 +186,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateStats(c *testing.T) {
 		assert.NilError(c, err)
 		assert.Equal(c, resp.Header.Get("Content-Type"), "application/json")
 
-		var v *types.Stats
+		var v *container.StatsResponse
 		err = json.NewDecoder(body).Decode(&v)
 		assert.NilError(c, err)
 		body.Close()
@@ -209,7 +210,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateMemoryWithSwapMemory(c *testing.T) {
 	cli.DockerCmd(c, "run", "-d", "--name", name, "--memory", "300M", "busybox", "top")
 	out, _, err := dockerCmdWithError("update", "--memory", "800M", name)
 	assert.ErrorContains(c, err, "")
-	assert.Assert(c, strings.Contains(out, "Memory limit should be smaller than already set memoryswap limit"))
+	assert.Assert(c, is.Contains(out, "Memory limit should be smaller than already set memoryswap limit"))
 
 	cli.DockerCmd(c, "update", "--memory", "800M", "--memory-swap", "1000M", name)
 }
@@ -231,7 +232,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateNotAffectMonitorRestartPolicy(c *testin
 	assert.NilError(c, cmd.Start())
 	defer cmd.Process.Kill()
 
-	_, err = cpty.Write([]byte("exit\n"))
+	_, err = cpty.WriteString("exit\n")
 	assert.NilError(c, err)
 
 	assert.NilError(c, cmd.Wait())
@@ -267,7 +268,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateWithNanoCPUs(c *testing.T) {
 
 	out, _, err = dockerCmdWithError("update", "--cpu-quota", "80000", "top")
 	assert.ErrorContains(c, err, "")
-	assert.Assert(c, strings.Contains(out, "Conflicting options: CPU Quota cannot be updated as NanoCPUs has already been set"))
+	assert.Assert(c, is.Contains(out, "Conflicting options: CPU Quota cannot be updated as NanoCPUs has already been set"))
 
 	cli.DockerCmd(c, "update", "--cpus", "0.8", "top")
 	inspect, err = clt.ContainerInspect(testutil.GetContext(c), "top")

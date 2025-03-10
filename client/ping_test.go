@@ -24,7 +24,7 @@ func TestPingFail(t *testing.T) {
 			resp := &http.Response{StatusCode: http.StatusInternalServerError}
 			if withHeader {
 				resp.Header = http.Header{}
-				resp.Header.Set("API-Version", "awesome")
+				resp.Header.Set("Api-Version", "awesome")
 				resp.Header.Set("Docker-Experimental", "true")
 				resp.Header.Set("Swarm", "inactive")
 			}
@@ -72,7 +72,7 @@ func TestPingSuccess(t *testing.T) {
 		client: newMockClient(func(req *http.Request) (*http.Response, error) {
 			resp := &http.Response{StatusCode: http.StatusOK}
 			resp.Header = http.Header{}
-			resp.Header.Set("API-Version", "awesome")
+			resp.Header.Set("Api-Version", "awesome")
 			resp.Header.Set("Docker-Experimental", "true")
 			resp.Header.Set("Swarm", "active/manager")
 			resp.Body = io.NopCloser(strings.NewReader("OK"))
@@ -111,7 +111,6 @@ func TestPingHeadFallback(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(http.StatusText(tc.status), func(t *testing.T) {
 			var reqs []string
 			client := &Client{
@@ -122,7 +121,7 @@ func TestPingHeadFallback(t *testing.T) {
 						resp.StatusCode = tc.status
 					}
 					resp.Header = http.Header{}
-					resp.Header.Add("API-Version", strings.Join(reqs, ", "))
+					resp.Header.Add("Api-Version", strings.Join(reqs, ", "))
 					return resp, nil
 				}),
 			}

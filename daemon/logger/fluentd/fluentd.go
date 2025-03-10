@@ -14,7 +14,7 @@ import (
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/loggerutils"
 	"github.com/docker/docker/errdefs"
-	units "github.com/docker/go-units"
+	"github.com/docker/go-units"
 	"github.com/fluent/fluent-logger-golang/fluent"
 	"github.com/pkg/errors"
 )
@@ -52,7 +52,6 @@ const (
 
 	addressKey                = "fluentd-address"
 	asyncKey                  = "fluentd-async"
-	asyncConnectKey           = "fluentd-async-connect" // deprecated option (use fluent-async instead)
 	asyncReconnectIntervalKey = "fluentd-async-reconnect-interval"
 	bufferLimitKey            = "fluentd-buffer-limit"
 	maxRetriesKey             = "fluentd-max-retries"
@@ -84,15 +83,17 @@ func New(info logger.Info) (logger.Logger, error) {
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	extra, err := info.ExtraAttributes(nil)
+	extraAttrs, err := info.ExtraAttributes(nil)
 	if err != nil {
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	log.G(context.TODO()).WithField("container", info.ContainerID).WithField("config", fluentConfig).
-		Debug("logging driver fluentd configured")
+	log.G(context.TODO()).WithFields(log.Fields{
+		"container": info.ContainerID,
+		"config":    fluentConfig,
+	}).Debug("logging driver fluentd configured")
 
-	log, err := fluent.New(fluentConfig)
+	writer, err := fluent.New(fluentConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -100,8 +101,8 @@ func New(info logger.Info) (logger.Logger, error) {
 		tag:           tag,
 		containerID:   info.ContainerID,
 		containerName: info.ContainerName,
-		writer:        log,
-		extra:         extra,
+		writer:        writer,
+		extra:         extraAttrs,
 	}, nil
 }
 
@@ -149,7 +150,6 @@ func ValidateLogOpt(cfg map[string]string) error {
 
 		case addressKey:
 		case asyncKey:
-		case asyncConnectKey:
 		case asyncReconnectIntervalKey:
 		case bufferLimitKey:
 		case maxRetriesKey:
@@ -201,10 +201,6 @@ func parseConfig(cfg map[string]string) (fluent.Config, error) {
 		maxRetries = int(mr64)
 	}
 
-	if cfg[asyncKey] != "" && cfg[asyncConnectKey] != "" {
-		return config, errors.Errorf("conflicting options: cannot specify both '%s' and '%s", asyncKey, asyncConnectKey)
-	}
-
 	async := false
 	if cfg[asyncKey] != "" {
 		if async, err = strconv.ParseBool(cfg[asyncKey]); err != nil {
@@ -212,25 +208,19 @@ func parseConfig(cfg map[string]string) (fluent.Config, error) {
 		}
 	}
 
-	// TODO fluentd-async-connect is deprecated in driver v1.4.0. Remove after two stable releases
-	asyncConnect := false
-	if cfg[asyncConnectKey] != "" {
-		if asyncConnect, err = strconv.ParseBool(cfg[asyncConnectKey]); err != nil {
-			return config, err
-		}
-	}
-
-	asyncReconnectInterval := 0
+	var asyncReconnectInterval int
 	if cfg[asyncReconnectIntervalKey] != "" {
 		interval, err := time.ParseDuration(cfg[asyncReconnectIntervalKey])
 		if err != nil {
 			return config, errors.Wrapf(err, "invalid value for %s", asyncReconnectIntervalKey)
 		}
-		if interval != 0 && (interval < minReconnectInterval || interval > maxReconnectInterval) {
-			return config, errors.Errorf("invalid value for %s: value (%q) must be between %s and %s",
-				asyncReconnectIntervalKey, interval, minReconnectInterval, maxReconnectInterval)
+		if interval != 0 {
+			if interval < minReconnectInterval || interval > maxReconnectInterval {
+				return config, errors.Errorf("invalid value for %s: value (%q) must be between %s and %s",
+					asyncReconnectIntervalKey, interval, minReconnectInterval, maxReconnectInterval)
+			}
+			asyncReconnectInterval = int(interval.Milliseconds())
 		}
-		asyncReconnectInterval = int(interval.Milliseconds())
 	}
 
 	subSecondPrecision := false
@@ -256,11 +246,10 @@ func parseConfig(cfg map[string]string) (fluent.Config, error) {
 		RetryWait:              retryWait,
 		MaxRetry:               maxRetries,
 		Async:                  async,
-		AsyncConnect:           asyncConnect,
 		AsyncReconnectInterval: asyncReconnectInterval,
 		SubSecondPrecision:     subSecondPrecision,
 		RequestAck:             requestAck,
-		ForceStopAsyncSend:     async || asyncConnect,
+		ForceStopAsyncSend:     async,
 	}
 
 	return config, nil

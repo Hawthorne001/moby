@@ -10,13 +10,16 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/containerd/containerd/images"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/log"
+	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
 	"github.com/docker/distribution"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/image"
 	v1 "github.com/docker/docker/image/v1"
+	"github.com/docker/docker/internal/ioutils"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/system"
@@ -42,20 +45,20 @@ type saveSession struct {
 	savedConfigs map[string]struct{}
 }
 
-func (l *tarexporter) Save(names []string, outStream io.Writer) error {
-	images, err := l.parseNames(names)
+func (l *tarexporter) Save(ctx context.Context, names []string, outStream io.Writer) error {
+	imgDescriptors, err := l.parseNames(ctx, names)
 	if err != nil {
 		return err
 	}
 
 	// Release all the image top layer references
-	defer l.releaseLayerReferences(images)
-	return (&saveSession{tarexporter: l, images: images}).save(outStream)
+	defer l.releaseLayerReferences(imgDescriptors)
+	return (&saveSession{tarexporter: l, images: imgDescriptors}).save(ctx, outStream)
 }
 
 // parseNames will parse the image names to a map which contains image.ID to *imageDescriptor.
 // Each imageDescriptor holds an image top layer reference named 'layerRef'. It is taken here, should be released later.
-func (l *tarexporter) parseNames(names []string) (desc map[image.ID]*imageDescriptor, rErr error) {
+func (l *tarexporter) parseNames(ctx context.Context, names []string) (desc map[image.ID]*imageDescriptor, rErr error) {
 	imgDescr := make(map[image.ID]*imageDescriptor)
 	defer func() {
 		if rErr != nil {
@@ -92,6 +95,12 @@ func (l *tarexporter) parseNames(names []string) (desc map[image.ID]*imageDescri
 	}
 
 	for _, name := range names {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
 		ref, err := reference.ParseAnyReference(name)
 		if err != nil {
 			return nil, err
@@ -156,16 +165,21 @@ func (l *tarexporter) takeLayerReference(id image.ID, imgDescr *imageDescriptor)
 	if err := image.CheckOS(img.OperatingSystem()); err != nil {
 		return fmt.Errorf("os %q is not supported", img.OperatingSystem())
 	}
+	if l.platform != nil {
+		if !l.platformMatcher.Match(img.Platform()) {
+			return errors.New("no suitable export target found for platform " + platforms.FormatAll(*l.platform))
+		}
+	}
 	imgDescr.image = img
 	topLayerID := img.RootFS.ChainID()
 	if topLayerID == "" {
 		return nil
 	}
-	layer, err := l.lss.Get(topLayerID)
+	topLayer, err := l.lss.Get(topLayerID)
 	if err != nil {
 		return err
 	}
-	imgDescr.layerRef = layer
+	imgDescr.layerRef = topLayer
 	return nil
 }
 
@@ -179,7 +193,7 @@ func (l *tarexporter) releaseLayerReferences(imgDescr map[image.ID]*imageDescrip
 	return nil
 }
 
-func (s *saveSession) save(outStream io.Writer) error {
+func (s *saveSession) save(ctx context.Context, outStream io.Writer) error {
 	s.savedConfigs = make(map[string]struct{})
 	s.savedLayers = make(map[layer.DiffID]distribution.Descriptor)
 
@@ -199,7 +213,13 @@ func (s *saveSession) save(outStream io.Writer) error {
 	var manifestDescriptors []ocispec.Descriptor
 
 	for id, imageDescr := range s.images {
-		foreignSrcs, err := s.saveImage(id)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		foreignSrcs, err := s.saveImage(ctx, id)
 		if err != nil {
 			return err
 		}
@@ -223,9 +243,7 @@ func (s *saveSession) save(outStream io.Writer) error {
 			})
 		}
 
-		imgPlat := imageDescr.image.Platform()
-
-		m := ocispec.Manifest{
+		data, err := json.Marshal(ocispec.Manifest{
 			Versioned: specs.Versioned{
 				SchemaVersion: 2,
 			},
@@ -234,19 +252,16 @@ func (s *saveSession) save(outStream io.Writer) error {
 				MediaType: ocispec.MediaTypeImageConfig,
 				Digest:    digest.Digest(imageDescr.image.ID()),
 				Size:      int64(len(imageDescr.image.RawJSON())),
-				Platform:  &imgPlat,
 			},
 			Layers: foreign,
-		}
-
-		data, err := json.Marshal(m)
+		})
 		if err != nil {
 			return errors.Wrap(err, "error marshaling manifest")
 		}
 		dgst := digest.FromBytes(data)
 
 		mFile := filepath.Join(s.outDir, ocispec.ImageBlobsDir, dgst.Algorithm().String(), dgst.Encoded())
-		if err := os.MkdirAll(filepath.Dir(mFile), 0o755); err != nil {
+		if err := mkdirAllWithChtimes(filepath.Dir(mFile), 0o755, time.Unix(0, 0), time.Unix(0, 0)); err != nil {
 			return errors.Wrap(err, "error creating blob directory")
 		}
 		if err := system.Chtimes(filepath.Dir(mFile), time.Unix(0, 0), time.Unix(0, 0)); err != nil {
@@ -258,13 +273,11 @@ func (s *saveSession) save(outStream io.Writer) error {
 		if err := system.Chtimes(mFile, time.Unix(0, 0), time.Unix(0, 0)); err != nil {
 			return errors.Wrap(err, "error setting blob directory timestamps")
 		}
-		size := int64(len(data))
 
 		untaggedMfstDesc := ocispec.Descriptor{
 			MediaType: ocispec.MediaTypeImageManifest,
 			Digest:    dgst,
-			Size:      size,
-			Platform:  m.Config.Platform,
+			Size:      int64(len(data)),
 		}
 		for _, ref := range imageDescr.refs {
 			familiarName := reference.FamiliarName(ref)
@@ -276,8 +289,8 @@ func (s *saveSession) save(outStream io.Writer) error {
 
 			taggedManifest := untaggedMfstDesc
 			taggedManifest.Annotations = map[string]string{
-				images.AnnotationImageName: ref.String(),
-				ocispec.AnnotationRefName:  ref.Tag(),
+				c8dimages.AnnotationImageName: ref.String(),
+				ocispec.AnnotationRefName:     ref.Tag(),
 			}
 			manifestDescriptors = append(manifestDescriptors, taggedManifest)
 		}
@@ -303,7 +316,7 @@ func (s *saveSession) save(outStream io.Writer) error {
 
 		parentID, _ := s.is.GetParent(id)
 		parentLinks = append(parentLinks, parentLink{id, parentID})
-		s.tarexporter.loggerImgEvent.LogImageEvent(id.String(), id.String(), events.ActionSave)
+		s.tarexporter.loggerImgEvent.LogImageEvent(ctx, id.String(), id.String(), events.ActionSave)
 	}
 
 	for i, p := range validatedParentLinks(parentLinks) {
@@ -372,27 +385,57 @@ func (s *saveSession) save(outStream io.Writer) error {
 	if err := os.WriteFile(idxFile, data, 0o644); err != nil {
 		return errors.Wrap(err, "error writing oci index file")
 	}
+	if err := system.Chtimes(idxFile, time.Unix(0, 0), time.Unix(0, 0)); err != nil {
+		return errors.Wrap(err, "error setting oci index file timestamps")
+	}
+
+	return s.writeTar(ctx, tempDir, outStream)
+}
+
+func (s *saveSession) writeTar(ctx context.Context, tempDir string, outStream io.Writer) error {
+	ctx, span := tracing.StartSpan(ctx, "writeTar")
+	defer span.End()
 
 	fs, err := archive.Tar(tempDir, archive.Uncompressed)
 	if err != nil {
+		span.SetStatus(err)
 		return err
 	}
 	defer fs.Close()
 
-	_, err = io.Copy(outStream, fs)
+	_, err = ioutils.CopyCtx(ctx, outStream, fs)
+
+	span.SetStatus(err)
 	return err
 }
 
-func (s *saveSession) saveImage(id image.ID) (map[layer.DiffID]distribution.Descriptor, error) {
+func (s *saveSession) saveImage(ctx context.Context, id image.ID) (_ map[layer.DiffID]distribution.Descriptor, outErr error) {
+	ctx, span := tracing.StartSpan(ctx, "saveImage")
+	span.SetAttributes(tracing.Attribute("image.id", id.String()))
+	defer span.End()
+	defer func() {
+		span.SetStatus(outErr)
+	}()
+
 	img := s.images[id].image
 	if len(img.RootFS.DiffIDs) == 0 {
 		return nil, fmt.Errorf("empty export - not implemented")
+	}
+
+	ts := time.Unix(0, 0)
+	if img.Created != nil {
+		ts = *img.Created
 	}
 
 	var parent digest.Digest
 	var layers []layer.DiffID
 	var foreignSrcs map[layer.DiffID]distribution.Descriptor
 	for i, diffID := range img.RootFS.DiffIDs {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 		v1ImgCreated := time.Unix(0, 0)
 		v1Img := image.V1Image{
 			// This is for backward compatibility used for
@@ -415,7 +458,7 @@ func (s *saveSession) saveImage(id image.ID) (map[layer.DiffID]distribution.Desc
 		}
 
 		v1Img.OS = img.OS
-		src, err := s.saveConfigAndLayer(rootFS.ChainID(), v1Img, img.Created)
+		src, err := s.saveConfigAndLayer(ctx, rootFS.ChainID(), v1Img, &ts)
 		if err != nil {
 			return nil, err
 		}
@@ -434,33 +477,44 @@ func (s *saveSession) saveImage(id image.ID) (map[layer.DiffID]distribution.Desc
 	dgst := digest.FromBytes(data)
 
 	blobDir := filepath.Join(s.outDir, ocispec.ImageBlobsDir, dgst.Algorithm().String())
-	if err := os.MkdirAll(blobDir, 0o755); err != nil {
+	if err := mkdirAllWithChtimes(blobDir, 0o755, ts, ts); err != nil {
 		return nil, err
 	}
-	if img.Created != nil {
-		if err := system.Chtimes(blobDir, *img.Created, *img.Created); err != nil {
-			return nil, err
-		}
-		if err := system.Chtimes(filepath.Dir(blobDir), *img.Created, *img.Created); err != nil {
-			return nil, err
-		}
+	if err := system.Chtimes(blobDir, ts, ts); err != nil {
+		return nil, err
+	}
+	if err := system.Chtimes(filepath.Dir(blobDir), ts, ts); err != nil {
+		return nil, err
 	}
 
 	configFile := filepath.Join(blobDir, dgst.Encoded())
 	if err := os.WriteFile(configFile, img.RawJSON(), 0o644); err != nil {
 		return nil, err
 	}
-	if img.Created != nil {
-		if err := system.Chtimes(configFile, *img.Created, *img.Created); err != nil {
-			return nil, err
-		}
+	if err := system.Chtimes(configFile, ts, ts); err != nil {
+		return nil, err
 	}
 
 	s.images[id].layers = layers
 	return foreignSrcs, nil
 }
 
-func (s *saveSession) saveConfigAndLayer(id layer.ChainID, legacyImg image.V1Image, createdTime *time.Time) (distribution.Descriptor, error) {
+func (s *saveSession) saveConfigAndLayer(ctx context.Context, id layer.ChainID, legacyImg image.V1Image, createdTime *time.Time) (_ distribution.Descriptor, outErr error) {
+	ctx, span := tracing.StartSpan(ctx, "saveConfigAndLayer")
+	span.SetAttributes(
+		tracing.Attribute("layer.id", id.String()),
+		tracing.Attribute("image.id", legacyImg.ID),
+	)
+	defer span.End()
+	defer func() {
+		span.SetStatus(outErr)
+	}()
+
+	ts := time.Unix(0, 0)
+	if createdTime != nil {
+		ts = *createdTime
+	}
+
 	outDir := filepath.Join(s.outDir, ocispec.ImageBlobsDir)
 
 	if _, ok := s.savedConfigs[legacyImg.ID]; !ok {
@@ -497,7 +551,7 @@ func (s *saveSession) saveConfigAndLayer(id layer.ChainID, legacyImg image.V1Ima
 
 	// We use sequential file access to avoid depleting the standby list on
 	// Windows. On Linux, this equates to a regular os.Create.
-	if err := os.MkdirAll(filepath.Dir(layerPath), 0o755); err != nil {
+	if err := mkdirAllWithChtimes(filepath.Dir(layerPath), 0o755, ts, ts); err != nil {
 		return distribution.Descriptor{}, errors.Wrap(err, "could not create layer dir parent")
 	}
 	tarFile, err := sequential.Create(layerPath)
@@ -515,7 +569,7 @@ func (s *saveSession) saveConfigAndLayer(id layer.ChainID, legacyImg image.V1Ima
 	digester := digest.Canonical.Digester()
 	digestedArch := io.TeeReader(arch, digester.Hash())
 
-	tarSize, err := io.Copy(tarFile, digestedArch)
+	tarSize, err := ioutils.CopyCtx(ctx, tarFile, digestedArch)
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
@@ -531,12 +585,10 @@ func (s *saveSession) saveConfigAndLayer(id layer.ChainID, legacyImg image.V1Ima
 		layerPath = filepath.Join(outDir, lDgst.Algorithm().String(), lDgst.Encoded())
 	}
 
-	if createdTime != nil {
-		for _, fname := range []string{outDir, layerPath} {
-			// todo: maybe save layer created timestamp?
-			if err := system.Chtimes(fname, *createdTime, *createdTime); err != nil {
-				return distribution.Descriptor{}, errors.Wrap(err, "could not set layer timestamp")
-			}
+	for _, fname := range []string{outDir, layerPath} {
+		// todo: maybe save layer created timestamp?
+		if err := system.Chtimes(fname, ts, ts); err != nil {
+			return distribution.Descriptor{}, errors.Wrap(err, "could not set layer timestamp")
 		}
 	}
 
@@ -563,9 +615,14 @@ func (s *saveSession) saveConfig(legacyImg image.V1Image, outDir string, created
 		return err
 	}
 
+	ts := time.Unix(0, 0)
+	if createdTime != nil {
+		ts = *createdTime
+	}
+
 	cfgDgst := digest.FromBytes(imageConfig)
 	configPath := filepath.Join(outDir, cfgDgst.Algorithm().String(), cfgDgst.Encoded())
-	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+	if err := mkdirAllWithChtimes(filepath.Dir(configPath), 0o755, ts, ts); err != nil {
 		return errors.Wrap(err, "could not create layer dir parent")
 	}
 
@@ -573,10 +630,8 @@ func (s *saveSession) saveConfig(legacyImg image.V1Image, outDir string, created
 		return err
 	}
 
-	if createdTime != nil {
-		if err := system.Chtimes(configPath, *createdTime, *createdTime); err != nil {
-			return errors.Wrap(err, "could not set config timestamp")
-		}
+	if err := system.Chtimes(configPath, ts, ts); err != nil {
+		return errors.Wrap(err, "could not set config timestamp")
 	}
 
 	s.savedConfigs[legacyImg.ID] = struct{}{}

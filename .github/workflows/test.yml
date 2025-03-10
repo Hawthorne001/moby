@@ -1,5 +1,14 @@
 name: test
 
+# Default to 'contents: read', which grants actions to read commits.
+#
+# If any permission is set, any permission not included in the list is
+# implicitly set to "none".
+#
+# see https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -10,19 +19,23 @@ on:
     branches:
       - 'master'
       - '[0-9]+.[0-9]+'
+      - '[0-9]+.x'
   pull_request:
 
 env:
-  GO_VERSION: "1.21.8"
+  GO_VERSION: "1.23.7"
   GIT_PAGER: "cat"
   PAGER: "cat"
+  SETUP_BUILDX_VERSION: edge
+  SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
 
 jobs:
   validate-dco:
     uses: ./.github/workflows/.dco.yml
 
   build-dev:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120 # guardrails timeout for the whole job
     needs:
       - validate-dco
     strategy:
@@ -39,14 +52,15 @@ jobs:
             echo "SYSTEMD=true" >> $GITHUB_ENV
           fi
       -
-        name: Checkout
-        uses: actions/checkout@v4
-      -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
       -
         name: Build dev image
-        uses: docker/bake-action@v4
+        uses: docker/bake-action@v6
         with:
           targets: dev
           set: |
@@ -70,7 +84,8 @@ jobs:
       storage: ${{ matrix.storage }}
 
   validate-prepare:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10 # guardrails timeout for the whole job
     needs:
       - validate-dco
     outputs:
@@ -91,8 +106,8 @@ jobs:
           echo ${{ steps.scripts.outputs.matrix }}
 
   validate:
-    runs-on: ubuntu-20.04
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30 # guardrails timeout for the whole job
     needs:
       - validate-prepare
       - build-dev
@@ -112,9 +127,13 @@ jobs:
       -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
       -
         name: Build dev image
-        uses: docker/bake-action@v4
+        uses: docker/bake-action@v6
         with:
           targets: dev
           set: |
@@ -125,7 +144,8 @@ jobs:
           make -o build validate-${{ matrix.script }}
 
   smoke-prepare:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10 # guardrails timeout for the whole job
     needs:
       - validate-dco
     outputs:
@@ -146,7 +166,8 @@ jobs:
           echo ${{ steps.platforms.outputs.matrix }}
 
   smoke:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20 # guardrails timeout for the whole job
     needs:
       - smoke-prepare
     strategy:
@@ -154,9 +175,6 @@ jobs:
       matrix:
         platform: ${{ fromJson(needs.smoke-prepare.outputs.matrix) }}
     steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v4
       -
         name: Prepare
         run: |
@@ -168,9 +186,13 @@ jobs:
       -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
+          buildkitd-flags: --debug
       -
         name: Test
-        uses: docker/bake-action@v4
+        uses: docker/bake-action@v6
         with:
           targets: binary-smoketest
           set: |

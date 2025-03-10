@@ -4,10 +4,12 @@ package resolvconf
 
 import (
 	"bytes"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/opencontainers/go-digest"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
@@ -78,58 +80,58 @@ nameserver 1.2.3.4 # not 4.3.2.1`,
 	}
 }
 
-func TestGetNameserversAsCIDR(t *testing.T) {
+func TestGetNameserversAsPrefix(t *testing.T) {
 	for _, tc := range []struct {
 		input  string
-		result []string
+		result []netip.Prefix
 	}{
 		{
-			input: ``,
+			input:  ``,
+			result: []netip.Prefix{},
 		},
 		{
-			input: `search example.com`,
+			input:  `search example.com`,
+			result: []netip.Prefix{},
 		},
 		{
 			input:  `  nameserver 1.2.3.4   `,
-			result: []string{"1.2.3.4/32"},
+			result: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/32")},
 		},
 		{
 			input: `
 nameserver 1.2.3.4
 nameserver 40.3.200.10
 search example.com`,
-			result: []string{"1.2.3.4/32", "40.3.200.10/32"},
+			result: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/32"), netip.MustParsePrefix("40.3.200.10/32")},
 		},
 		{
 			input: `nameserver 1.2.3.4
 search example.com
 nameserver 4.30.20.100`,
-			result: []string{"1.2.3.4/32", "4.30.20.100/32"},
+			result: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/32"), netip.MustParsePrefix("4.30.20.100/32")},
 		},
 		{
 			input: `search example.com
 nameserver 1.2.3.4
 #nameserver 4.3.2.1`,
-			result: []string{"1.2.3.4/32"},
+			result: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/32")},
 		},
 		{
 			input: `search example.com
 nameserver 1.2.3.4 # not 4.3.2.1`,
-			result: []string{"1.2.3.4/32"},
+			result: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/32")},
 		},
 		{
 			input:  `nameserver fd6f:c490:ec68::1`,
-			result: []string{"fd6f:c490:ec68::1/128"},
+			result: []netip.Prefix{netip.MustParsePrefix("fd6f:c490:ec68::1/128")},
 		},
 		{
 			input:  `nameserver fe80::1234%eth0`,
-			result: []string{"fe80::1234/128"},
+			result: []netip.Prefix{netip.MustParsePrefix("fe80::1234/128")},
 		},
 	} {
-		test := GetNameserversAsCIDR([]byte(tc.input))
-		if !strSlicesEqual(test, tc.result) {
-			t.Errorf("Wrong nameserver string {%s} should be %v. Input: %s", test, tc.result, tc.input)
-		}
+		test := GetNameserversAsPrefix([]byte(tc.input))
+		assert.DeepEqual(t, test, tc.result, cmpopts.EquateComparable(netip.Prefix{}))
 	}
 }
 
@@ -287,6 +289,16 @@ func strSlicesEqual(a, b []string) bool {
 	return true
 }
 
+const (
+	// Example IP-addresses as defined in [RFC 5737], [RFC 3849, section 2].
+	//
+	// [RFC 5737]: https://datatracker.ietf.org/doc/html/rfc5737
+	// [RFC 3849, section 2]: https://datatracker.ietf.org/doc/html/rfc3849#section-2
+	testNS1 = "192.0.2.1"
+	testNS2 = "2001:db8::1"
+	testNS3 = "203.0.113.3"
+)
+
 func TestBuild(t *testing.T) {
 	tmpDir := t.TempDir()
 	file, err := os.CreateTemp(tmpDir, "")
@@ -294,12 +306,18 @@ func TestBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := Build(file.Name(), []string{"ns1", "ns2", "ns3"}, []string{"search1"}, []string{"opt1"})
+	f, err := Build(file.Name(), []string{testNS1, testNS2, testNS3}, []string{"search1"}, []string{"opt1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	const expected = "search search1\nnameserver ns1\nnameserver ns2\nnameserver ns3\noptions opt1\n"
+	const expected = `nameserver 192.0.2.1
+nameserver 2001:db8::1
+nameserver 203.0.113.3
+search search1
+options opt1
+`
+
 	if !bytes.Equal(f.Content, []byte(expected)) {
 		t.Errorf("Expected to find '%s' got '%s'", expected, f.Content)
 	}
@@ -319,12 +337,17 @@ func TestBuildWithZeroLengthDomainSearch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := Build(file.Name(), []string{"ns1", "ns2", "ns3"}, []string{"."}, []string{"opt1"})
+	f, err := Build(file.Name(), []string{testNS1, testNS2, testNS3}, []string{"."}, []string{"opt1"})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	const expected = "nameserver ns1\nnameserver ns2\nnameserver ns3\noptions opt1\n"
+	const expected = `nameserver 192.0.2.1
+nameserver 2001:db8::1
+nameserver 203.0.113.3
+options opt1
+`
+
 	if !bytes.Equal(f.Content, []byte(expected)) {
 		t.Errorf("Expected to find '%s' got '%s'", expected, f.Content)
 	}
@@ -344,12 +367,17 @@ func TestBuildWithNoOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f, err := Build(file.Name(), []string{"ns1", "ns2", "ns3"}, []string{"search1"}, []string{})
+	f, err := Build(file.Name(), []string{testNS1, testNS2, testNS3}, []string{"search1"}, []string{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	const expected = "search search1\nnameserver ns1\nnameserver ns2\nnameserver ns3\n"
+	const expected = `nameserver 192.0.2.1
+nameserver 2001:db8::1
+nameserver 203.0.113.3
+search search1
+`
+
 	if !bytes.Equal(f.Content, []byte(expected)) {
 		t.Errorf("Expected to find '%s' got '%s'", expected, f.Content)
 	}
