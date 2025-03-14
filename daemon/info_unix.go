@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	v2runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
+	runcoptions "github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/log"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
@@ -159,11 +159,9 @@ func (daemon *Daemon) fillPlatformInfo(ctx context.Context, v *system.Info, sysI
 	if !v.IPv4Forwarding {
 		v.Warnings = append(v.Warnings, "WARNING: IPv4 forwarding is disabled")
 	}
-	if !v.BridgeNfIptables {
-		v.Warnings = append(v.Warnings, "WARNING: bridge-nf-call-iptables is disabled")
-	}
-	if !v.BridgeNfIP6tables {
-		v.Warnings = append(v.Warnings, "WARNING: bridge-nf-call-ip6tables is disabled")
+	// Env-var belonging to the bridge driver, disables use of the iptables "raw" table.
+	if os.Getenv("DOCKER_INSECURE_NO_IPTABLES_RAW") == "1" {
+		v.Warnings = append(v.Warnings, "WARNING: DOCKER_INSECURE_NO_IPTABLES_RAW is set")
 	}
 	return nil
 }
@@ -196,7 +194,6 @@ func populateRuncCommit(v *system.Commit, cfg *configStore) error {
 		return err
 	}
 	v.ID = commit
-	v.Expected = commit
 	return nil
 }
 
@@ -223,7 +220,6 @@ func (daemon *Daemon) populateInitCommit(ctx context.Context, v *system.Info, cf
 		return nil
 	}
 	v.InitCommit.ID = commit
-	v.InitCommit.Expected = v.InitCommit.ID
 	return nil
 }
 
@@ -395,7 +391,7 @@ func parseDefaultRuntimeVersion(rts *runtimes) (runtime, version, commit string,
 	if err != nil {
 		return "", "", "", err
 	}
-	shimopts, ok := opts.(*v2runcoptions.Options)
+	shimopts, ok := opts.(*runcoptions.Options)
 	if !ok {
 		return "", "", "", fmt.Errorf("%s: retrieving version not supported", shim)
 	}
@@ -437,7 +433,6 @@ func (daemon *Daemon) populateContainerdCommit(ctx context.Context, v *system.Co
 		return nil
 	}
 	v.ID = rv.Revision
-	v.Expected = rv.Revision
 	return nil
 }
 

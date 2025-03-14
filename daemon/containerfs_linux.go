@@ -15,9 +15,8 @@ import (
 	"github.com/moby/sys/symlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/docker/docker/api/types"
+	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/container"
-	"github.com/docker/docker/internal/compatcontext"
 	"github.com/docker/docker/internal/mounttree"
 	"github.com/docker/docker/internal/unshare"
 	"github.com/docker/docker/pkg/fileutils"
@@ -54,27 +53,33 @@ type containerFSView struct {
 }
 
 // openContainerFS opens a new view of the container's filesystem.
-func (daemon *Daemon) openContainerFS(container *container.Container) (_ *containerFSView, err error) {
+func (daemon *Daemon) openContainerFS(ctr *container.Container) (_ *containerFSView, retErr error) {
 	ctx := context.TODO()
 
-	if err := daemon.Mount(container); err != nil {
+	if err := daemon.Mount(ctr); err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
-			_ = daemon.Unmount(container)
+		if retErr != nil {
+			if err := daemon.Unmount(ctr); err != nil {
+				log.G(ctx).WithError(err).Debug("Failed to unmount container after failure")
+			}
 		}
 	}()
 
-	mounts, cleanup, err := daemon.setupMounts(ctx, container)
+	mounts, cleanup, err := daemon.setupMounts(ctx, ctr)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		ctx := compatcontext.WithoutCancel(ctx)
-		cleanup(ctx)
-		if err != nil {
-			_ = container.UnmountVolumes(ctx, daemon.LogVolumeEvent)
+		ctx := context.WithoutCancel(ctx)
+		if err := cleanup(ctx); err != nil {
+			log.G(ctx).WithError(err).Debug("Failed to cleanup container mounts")
+		}
+		if retErr != nil {
+			if err := ctr.UnmountVolumes(ctx, daemon.LogVolumeEvent); err != nil {
+				log.G(ctx).WithError(err).Debug("Failed to unmount container volumes after failure")
+			}
 		}
 	}()
 
@@ -89,7 +94,7 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				return err
 			}
 			for _, m := range mounts {
-				dest, err := container.GetResourcePath(m.Destination)
+				dest, err := ctr.GetResourcePath(m.Destination)
 				if err != nil {
 					return err
 				}
@@ -147,7 +152,7 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 				}
 			}
 
-			return mounttree.SwitchRoot(container.BaseFS)
+			return mounttree.SwitchRoot(ctr.BaseFS)
 		},
 		func() {
 			defer close(done)
@@ -168,7 +173,7 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 	}
 	vw := &containerFSView{
 		d:    daemon,
-		ctr:  container,
+		ctr:  ctr,
 		todo: todo,
 		done: done,
 	}
@@ -176,7 +181,7 @@ func (daemon *Daemon) openContainerFS(container *container.Container) (_ *contai
 	return vw, nil
 }
 
-// RunInFS synchronously runs fn in the context of the container filesytem and
+// RunInFS synchronously runs fn in the context of the container filesystem and
 // passes through its return value.
 //
 // The container filesystem is only visible to functions called in the same
@@ -219,8 +224,8 @@ func (vw *containerFSView) Close() error {
 
 // Stat returns the metadata for path, relative to the current working directory
 // of vw inside the container filesystem view.
-func (vw *containerFSView) Stat(ctx context.Context, path string) (*types.ContainerPathStat, error) {
-	var stat *types.ContainerPathStat
+func (vw *containerFSView) Stat(ctx context.Context, path string) (*containertypes.PathStat, error) {
+	var stat *containertypes.PathStat
 	err := vw.RunInFS(ctx, func() error {
 		lstat, err := os.Lstat(path)
 		if err != nil {
@@ -235,7 +240,7 @@ func (vw *containerFSView) Stat(ctx context.Context, path string) (*types.Contai
 				return err
 			}
 		}
-		stat = &types.ContainerPathStat{
+		stat = &containertypes.PathStat{
 			Name:       filepath.Base(path),
 			Size:       lstat.Size(),
 			Mode:       lstat.Mode(),

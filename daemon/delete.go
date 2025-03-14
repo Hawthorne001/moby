@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 
-	cerrdefs "github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/leases"
 	"github.com/containerd/log"
 	"github.com/docker/docker/api/types/backend"
 	containertypes "github.com/docker/docker/api/types/container"
@@ -17,7 +15,8 @@ import (
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/containerfs"
+	"github.com/docker/docker/internal/containerfs"
+	"github.com/docker/docker/internal/metrics"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
 )
@@ -54,7 +53,7 @@ func (daemon *Daemon) containerRm(cfg *config.Config, name string, opts *backend
 	}
 
 	err = daemon.cleanupContainer(ctr, *opts)
-	containerActions.WithValues("delete").UpdateSince(start)
+	metrics.ContainerActions.WithValues("delete").UpdateSince(start)
 
 	return err
 }
@@ -69,14 +68,13 @@ func (daemon *Daemon) rmLink(cfg *config.Config, container *container.Container,
 	}
 
 	parent = strings.TrimSuffix(parent, "/")
-	pe, err := daemon.containersReplica.Snapshot().GetID(parent)
+	parentID, err := daemon.containersReplica.Snapshot().GetID(parent)
 	if err != nil {
 		return fmt.Errorf("Cannot get parent %s for link name %s", parent, name)
 	}
 
 	daemon.releaseName(name)
-	parentContainer, _ := daemon.GetContainer(pe)
-	if parentContainer != nil {
+	if parentContainer := daemon.containers.Get(parentID); parentContainer != nil {
 		daemon.linkIndex.unlink(name, container, parentContainer)
 		if err := daemon.updateNetwork(cfg, parentContainer); err != nil {
 			log.G(context.TODO()).Debugf("Could not update network to remove link %s: %v", n, err)
@@ -125,35 +123,30 @@ func (daemon *Daemon) cleanupContainer(container *container.Container, config ba
 	container.Lock()
 	container.Dead = true
 
+	// Copy RWLayer for releasing and clear the reference while holding the container lock.
+	rwLayer := container.RWLayer
+	container.RWLayer = nil
+
 	// Save container state to disk. So that if error happens before
 	// container meta file got removed from disk, then a restart of
 	// docker should not make a dead container alive.
-	if err := container.CheckpointTo(daemon.containersReplica); err != nil && !os.IsNotExist(err) {
+	if err := container.CheckpointTo(context.WithoutCancel(context.TODO()), daemon.containersReplica); err != nil && !os.IsNotExist(err) {
 		log.G(context.TODO()).Errorf("Error saving dying container to disk: %v", err)
 	}
 	container.Unlock()
 
 	// When container creation fails and `RWLayer` has not been created yet, we
 	// do not call `ReleaseRWLayer`
-	if container.RWLayer != nil {
-		if err := daemon.imageService.ReleaseLayer(container.RWLayer); err != nil {
+	if rwLayer != nil {
+		if err := daemon.imageService.ReleaseLayer(rwLayer); err != nil {
+			// Restore the reference on error as it possibly was not released.
+			container.Lock()
+			container.RWLayer = rwLayer
+			container.Unlock()
+
 			err = errors.Wrapf(err, "container %s", container.ID)
 			container.SetRemovalError(err)
 			return err
-		}
-		container.RWLayer = nil
-	} else {
-		if daemon.UsesSnapshotter() {
-			ls := daemon.containerdClient.LeasesService()
-			lease := leases.Lease{
-				ID: container.ID,
-			}
-			if err := ls.Delete(context.Background(), lease, leases.SynchronousDelete); err != nil {
-				if !cerrdefs.IsNotFound(err) {
-					container.SetRemovalError(err)
-					return err
-				}
-			}
 		}
 	}
 
@@ -161,6 +154,8 @@ func (daemon *Daemon) cleanupContainer(container *container.Container, config ba
 	// so that other goroutines don't attempt to concurrently open files
 	// within it. Having any file open on Windows (without the
 	// FILE_SHARE_DELETE flag) will block it from being deleted.
+	//
+	// TODO(thaJeztah): should this be moved to the "container" itself, or possibly be delegated to the graphdriver or snapshotter?
 	container.Lock()
 	err := containerfs.EnsureRemoveAll(container.Root)
 	container.Unlock()
@@ -181,7 +176,7 @@ func (daemon *Daemon) cleanupContainer(container *container.Container, config ba
 		daemon.releaseName(name)
 	}
 	container.SetRemoved()
-	stateCtr.del(container.ID)
+	metrics.StateCtr.Delete(container.ID)
 
 	daemon.LogContainerEvent(container, events.ActionDestroy)
 	return nil

@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/testutil"
@@ -15,7 +15,14 @@ import (
 	"gotest.tools/v3/assert"
 )
 
-var frozenImages = []string{"busybox:latest", "busybox:glibc", "hello-world:frozen", "debian:bookworm-slim"}
+var frozenImages = []string{
+	"busybox:latest",
+	"busybox:glibc",
+	"hello-world:frozen",
+	"debian:bookworm-slim",
+	"hello-world:amd64",
+	"hello-world:arm64",
+}
 
 type protectedElements struct {
 	containers map[string]struct{}
@@ -160,7 +167,7 @@ func ProtectNetworks(ctx context.Context, t testing.TB, testEnv *Execution) {
 func getExistingNetworks(ctx context.Context, t testing.TB, testEnv *Execution) []string {
 	t.Helper()
 	client := testEnv.APIClient()
-	networkList, err := client.NetworkList(ctx, types.NetworkListOptions{})
+	networkList, err := client.NetworkList(ctx, network.ListOptions{})
 	assert.NilError(t, err, "failed to list networks")
 
 	var networks []string

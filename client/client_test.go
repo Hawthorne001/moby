@@ -88,7 +88,6 @@ func TestNewClientWithOpsFromEnv(t *testing.T) {
 
 	env.PatchAll(t, nil)
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			env.PatchAll(t, tc.envs)
 			client, err := NewClientWithOpts(FromEnv)
@@ -323,7 +322,6 @@ func TestNegotiateAPIVersion(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.doc, func(t *testing.T) {
 			opts := make([]Opt, 0)
 			if tc.clientVersion != "" {
@@ -342,7 +340,7 @@ func TestNegotiateAPIVersion(t *testing.T) {
 
 // TestNegotiateAPIVersionOverride asserts that we honor the DOCKER_API_VERSION
 // environment variable when negotiating versions.
-func TestNegotiateAPVersionOverride(t *testing.T) {
+func TestNegotiateAPIVersionOverride(t *testing.T) {
 	const expected = "9.99"
 	t.Setenv("DOCKER_API_VERSION", expected)
 
@@ -354,9 +352,9 @@ func TestNegotiateAPVersionOverride(t *testing.T) {
 	assert.Equal(t, client.ClientVersion(), expected)
 }
 
-// TestNegotiateAPVersionConnectionFailure asserts that we do not modify the
+// TestNegotiateAPIVersionConnectionFailure asserts that we do not modify the
 // API version when failing to connect.
-func TestNegotiateAPVersionConnectionFailure(t *testing.T) {
+func TestNegotiateAPIVersionConnectionFailure(t *testing.T) {
 	const expected = "9.99"
 
 	client, err := NewClientWithOpts(WithHost("tcp://no-such-host.invalid"))
@@ -371,7 +369,7 @@ func TestNegotiateAPIVersionAutomatic(t *testing.T) {
 	var pingVersion string
 	httpClient := newMockClient(func(req *http.Request) (*http.Response, error) {
 		resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}}
-		resp.Header.Set("API-Version", pingVersion)
+		resp.Header.Set("Api-Version", pingVersion)
 		resp.Body = io.NopCloser(strings.NewReader("OK"))
 		return resp, nil
 	})
@@ -420,6 +418,58 @@ func TestNegotiateAPIVersionWithFixedVersion(t *testing.T) {
 
 	client.NegotiateAPIVersionPing(types.Ping{APIVersion: "1.31"})
 	assert.Equal(t, client.ClientVersion(), customVersion)
+}
+
+// TestCustomAPIVersion tests initializing the client with a custom
+// version.
+func TestCustomAPIVersion(t *testing.T) {
+	tests := []struct {
+		version  string
+		expected string
+	}{
+		{
+			version:  "",
+			expected: api.DefaultVersion,
+		},
+		{
+			version:  "1.0",
+			expected: "1.0",
+		},
+		{
+			version:  "9.99",
+			expected: "9.99",
+		},
+		{
+			version:  "v",
+			expected: api.DefaultVersion,
+		},
+		{
+			version:  "v1.0",
+			expected: "1.0",
+		},
+		{
+			version:  "v9.99",
+			expected: "9.99",
+		},
+		{
+			// When manually setting a version, no validation happens.
+			// so anything is accepted.
+			version:  "something-weird",
+			expected: "something-weird",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.version, func(t *testing.T) {
+			client, err := NewClientWithOpts(WithVersion(tc.version))
+			assert.NilError(t, err)
+			assert.Equal(t, client.ClientVersion(), tc.expected)
+
+			t.Setenv(EnvOverrideAPIVersion, tc.expected)
+			client, err = NewClientWithOpts(WithVersionFromEnv())
+			assert.NilError(t, err)
+			assert.Equal(t, client.ClientVersion(), tc.expected)
+		})
+	}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -478,7 +528,6 @@ func TestClientRedirect(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.httpMethod, func(t *testing.T) {
 			req, err := http.NewRequest(tc.httpMethod, "/redirectme", nil)
 			assert.Check(t, err)

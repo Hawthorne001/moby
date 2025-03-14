@@ -69,7 +69,6 @@ func TestValidateIPAddress(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.input, func(t *testing.T) {
 			actualOut, actualErr := ValidateIPAddress(tc.input)
 			assert.Check(t, is.Equal(tc.expectedOut, actualOut))
@@ -142,7 +141,7 @@ func TestListOptsWithoutValidator(t *testing.T) {
 }
 
 func TestListOptsWithValidator(t *testing.T) {
-	// Re-using logOptsvalidator (used by MapOpts)
+	// Re-using logOptsValidator (used by MapOpts)
 	o := NewListOpts(logOptsValidator)
 	o.Set("foo")
 	if o.String() != "" {
@@ -226,14 +225,14 @@ func TestValidateDNSSearch(t *testing.T) {
 }
 
 func TestValidateLabel(t *testing.T) {
-	testCases := []struct {
+	tests := []struct {
 		name           string
 		label          string
 		expectedResult string
 		expectedErr    string
 	}{
 		{
-			name:        "lable with bad attribute format",
+			name:        "label with bad attribute format",
 			label:       "label",
 			expectedErr: "bad attribute format: label",
 		},
@@ -299,18 +298,17 @@ func TestValidateLabel(t *testing.T) {
 		},
 	}
 
-	for _, testCase := range testCases {
-		testCase := testCase
-		t.Run(testCase.name, func(t *testing.T) {
-			result, err := ValidateLabel(testCase.label)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := ValidateLabel(tc.label)
 
-			if testCase.expectedErr != "" {
-				assert.Error(t, err, testCase.expectedErr)
+			if tc.expectedErr != "" {
+				assert.Error(t, err, tc.expectedErr)
 			} else {
 				assert.NilError(t, err)
 			}
-			if testCase.expectedResult != "" {
-				assert.Check(t, is.Equal(result, testCase.expectedResult))
+			if tc.expectedResult != "" {
+				assert.Check(t, is.Equal(result, tc.expectedResult))
 			}
 		})
 	}
